@@ -75,6 +75,7 @@ from memory.config_manager     import (
     get_brief_enabled, get_media_resolution, get_proactive_audio_enabled,
     get_push_to_talk_enabled, get_thinking_enabled, get_turn_tuning, get_voice,
     get_wake_word_enabled, save_wake_word_enabled,    get_input_device, get_output_device,
+    get_claude_enabled,
 )
 from core                     import gemini as _gemini
 from core.plugin_loader        import discover_plugins
@@ -310,6 +311,17 @@ def _describe_limits(has_vision: bool, has_mic: bool) -> str:
             "- You hear nothing while the microphone is muted, and you cannot "
             "unmute it yourself.")
     return "\n".join(out)
+
+
+_IF_BLOCK = re.compile(r"\{if:([A-Za-z0-9_]+)\}[ \t]*\n?(.*?)\{/if\}[ \t]*\n?", re.S)
+
+
+def _keep_blocks_for(template: str, names: set) -> str:
+    """Keep a `{if:tool}...{/if}` block of the prompt only when that tool is
+    actually offered, so the model is never given rules about a tool it does not
+    have. Lives in the file, not in code, so the wording stays editable."""
+    return _IF_BLOCK.sub(lambda m: m.group(2) if m.group(1) in names else "",
+                         template or "")
 
 
 def _render_prompt(template: str, values: dict) -> str:
@@ -657,6 +669,10 @@ class JarvisLive:
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
+        # What the user's last utterance was, word for word, as the speech
+        # recogniser wrote it. Kept past turn_complete: a tool call can land
+        # after the turn that carried the words has already been closed.
+        self._heard_text = ""
 
         self._enhanced_live = True  # proactive audio; auto-disabled if the server rejects it
         self._tuned_live    = True  # turn-taking / media / thinking knobs; same fallback
@@ -1101,6 +1117,12 @@ class JarvisLive:
                 pass
         self.ui.write_log("SYS: Interrupted — listening...")
 
+    def _conversation_snapshot(self) -> dict:
+        """What `claude_task` is sent besides the Live model's own paraphrase:
+        the last utterance word for word, and the recent lines of the
+        conversation. Read from a worker thread; a list copy is all it needs."""
+        return {"heard": self._heard_text, "turns": list(self._session_log[-40:])}
+
     def speak(self, text: str):
         if not self._loop or not self.session:
             return
@@ -1194,8 +1216,18 @@ class JarvisLive:
                 print(f"[JARVIS] {len(_blocked)} tool(s) withheld — "
                       f"this engine cannot serve them")
 
+        # claude_task is offered only while Claude is switched on in CONTROLS.
+        # Declared and then failing on every non-trivial request would make the
+        # default install worse than it is today, so with it off the tool is
+        # simply not there and the prompt below says nothing about it.
+        if not get_claude_enabled():
+            _all_decls = [d for d in _all_decls
+                          if (d.get("name") if isinstance(d, dict)
+                              else getattr(d, "name", "")) != "claude_task"]
+
         _names = {(d.get("name") if isinstance(d, dict) else getattr(d, "name", ""))
                   for d in _all_decls}
+        sys_prompt = _keep_blocks_for(sys_prompt, _names)
         sys_prompt = _render_prompt(sys_prompt, {
             "assistant_name": self._asst_name,
             "platform": f"{_platform.system()} {_platform.release()}".strip(),
@@ -1452,7 +1484,8 @@ class JarvisLive:
                     args["folder"] = self.ui.current_file
                     args["mode"] = "improve"
                 _ctx = {"player": self.ui, "speak": self.speak,
-                        "response": None, "session_memory": None}
+                        "response": None, "session_memory": None,
+                        "conversation": self._conversation_snapshot}
                 r = await loop.run_in_executor(None, lambda: self._action_registry.run(name, args, _ctx))
                 result = r or "Done."
                 # web_search: mirror results to the on-screen content panel
@@ -1747,6 +1780,7 @@ class JarvisLive:
                             txt = _clean_transcript(sc.input_transcription.text)
                             if txt:
                                 in_buf.append(txt)
+                                self._heard_text = " ".join(in_buf).strip()
                                 self._last_user_speech = time.monotonic()
 
                         if sc.turn_complete:
