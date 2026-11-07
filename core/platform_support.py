@@ -26,6 +26,13 @@ WHY THIS EXISTS
         System Settings, and until then the same APIs return success and do
         nothing.
 
+    HYPRLAND IS THE EXCEPTION
+        Hyprland has its own control surface, so a Hyprland session is not
+        treated as generic Wayland: `core/hyprland.py` drives it with grim,
+        wtype, hyprctl and ydotool, and each capability is reported only if
+        its tool is present (click also needs the `ydotoold` service
+        answering). GNOME, KDE and other Wayland compositors are unchanged.
+
 WHAT THIS MODULE DOES ABOUT IT
     It does not fix any of that — none of it is fixable from inside the app.
     It makes it VISIBLE: the limits are reported to the user in the activity
@@ -54,12 +61,15 @@ class Support:
     can_control_input: bool = True      # type, click, hotkeys
     can_capture_screen: bool = True     # screenshots, vision
     can_focus_windows: bool = True      # raise another app's window
+    can_click: bool = True              # press the mouse (separate on Hyprland)
+    compositor: str = ""                # "hyprland" when its backend is in use
+    model_lines: list[str] = field(default_factory=list)   # replaces the generic limits
     notes: list[str] = field(default_factory=list)
 
     @property
     def fully_capable(self) -> bool:
         return (self.can_control_input and self.can_capture_screen
-                and self.can_focus_windows)
+                and self.can_focus_windows and self.can_click)
 
 
 def _linux_session() -> str:
@@ -74,6 +84,40 @@ def _linux_session() -> str:
     if os.environ.get("DISPLAY"):
         return "x11"
     return ""
+
+
+def _hyprland_support() -> Support:
+    """Hyprland answers per tool: each of grim, wtype, hyprctl and ydotool(d)
+    adds one capability, and the reason for each missing one is kept."""
+    from core import hyprland
+
+    caps = hyprland.capabilities()
+    support = Support(
+        os_name="Linux",
+        can_control_input=caps.keyboard,
+        can_capture_screen=caps.capture,
+        can_focus_windows=caps.windows,
+        can_click=caps.click,
+        compositor="hyprland",
+        model_lines=caps.lines_for_model(),
+    )
+    have = [name for name, ok in (
+        ("screen capture", caps.capture), ("keyboard", caps.keyboard),
+        ("windows and cursor", caps.windows), ("click", caps.click)) if ok]
+    support.notes.append(
+        "Hyprland session: the assistant can use "
+        + (", ".join(have) if have else "none of the screen tools") + ".")
+    for what, why in caps.missing.items():
+        support.notes.append(f"Cannot {what}: {why}")
+    return support
+
+
+def _is_hyprland() -> bool:
+    try:
+        from core import hyprland
+        return hyprland.active()
+    except Exception:
+        return False
 
 
 def detect() -> Support:
@@ -117,6 +161,9 @@ def detect() -> Support:
         )
         return support
 
+    if session == "wayland" and _is_hyprland():
+        return _hyprland_support()
+
     if session == "wayland":
         # The whole point of Wayland is that one client cannot drive another.
         # XWayland covers apps that ask for X11, but synthetic input into
@@ -152,6 +199,8 @@ def describe_for_model(support: Support) -> list[str]:
     told "you cannot do X here, and this is why" explains it to the user; a
     model told "do not do X" invents a reason.
     """
+    if support.model_lines:
+        return list(support.model_lines)
     lines: list[str] = []
     if not support.can_control_input:
         lines.append(
