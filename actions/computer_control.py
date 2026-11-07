@@ -15,7 +15,7 @@ import time
 import random
 from pathlib import Path
 
-from core import appidentity, outcome
+from core import appidentity, hyprland, outcome
 from core.lazyimport import LazyModule, installed
 
 # pyautogui and pyperclip are imported on first USE, not at launch — see
@@ -31,7 +31,9 @@ def _configure_pyautogui(module) -> None:
     module.PAUSE    = 0.05
 
 
-pyautogui = LazyModule("pyautogui", _configure_pyautogui)
+# On Hyprland the name `pyautogui` is answered by core/hyprland.py instead —
+# see AutoGuiProxy — so every helper below works unchanged.
+pyautogui = hyprland.AutoGuiProxy(LazyModule("pyautogui", _configure_pyautogui))
 pyperclip = LazyModule("pyperclip")
 
 def _base_dir() -> Path:
@@ -69,6 +71,7 @@ _SAFE_SCREENSHOT_ROOTS = (
 def _safe_screenshot_path(requested: str | None) -> Path:
     fallback = Path.home() / "Desktop" / "jarvis_screenshot.png"
     if not requested:
+        fallback.parent.mkdir(parents=True, exist_ok=True)
         return fallback
     try:
         p = Path(requested).expanduser().resolve()
@@ -87,6 +90,8 @@ def _require_pyautogui():
     what it was — the check that turns a missing optional dependency into an
     instruction rather than a traceback.
     """
+    if hyprland.active():
+        return
     if not _PYAUTOGUI:
         raise RuntimeError("PyAutoGUI not installed. Run: pip install pyautogui")
 
@@ -199,6 +204,15 @@ def _smart_type(text: str, clear_first: bool = True) -> str:
 
 def _click(x=None, y=None, button: str = "left", clicks: int = 1) -> str:
     _require_pyautogui()
+    if hyprland.active():
+        # ydotool exits 0 as soon as the daemon took the event; nothing says the
+        # click landed on anything, so "Clicked" would be a claim without a check.
+        pyautogui.click(x, y, button=button, clicks=clicks)
+        where = f"({x}, {y})" if x is not None and y is not None else "the current position"
+        return outcome.unverified(
+            "click", "the click was sent to the compositor but cannot be read back "
+            "- look at the screen to see whether it did what was meant",
+            at=where, button=button, clicks=clicks)
     if x is not None and y is not None:
         pyautogui.click(x, y, button=button, clicks=clicks)
         return f"{'Double-c' if clicks == 2 else 'C'}licked ({x}, {y}) [{button}]"
@@ -274,7 +288,19 @@ def _clear_field() -> str:
     pyautogui.press("delete")
     return "Field cleared"
 
+def _focus_window_hyprland(title: str) -> str:
+    try:
+        win = hyprland.focus_window(title)
+    except hyprland.HyprlandError as e:
+        return outcome.failed("focus_window", e.cause + (f" - {e.fix}" if e.fix else ""),
+                              title=title)
+    return outcome.done("focus_window", window=win.label(), title=win.title[:60],
+                        verified=True)
+
+
 def _focus_window(title: str) -> str:
+    if hyprland.active():
+        return _focus_window_hyprland(title)
     os_name = _get_os()
 
     if os_name == "windows":
@@ -329,6 +355,49 @@ def _focus_window(title: str) -> str:
 
     return f"focus_window: unknown OS '{os_name}'"
 
+def _close_app_windows(app_name: str, confirmed_index: int | None = None) -> str | None:
+    """On Hyprland, close the application through its WINDOWS.
+
+    `closewindow` is the same polite request as the close button, so an
+    application with unsaved work still gets to ask. Returns None when no
+    window matches — the caller then falls back to looking for the process, as
+    before. The assistant's own windows are never among the candidates.
+    """
+    try:
+        matches = hyprland.match_windows(app_name, hyprland.list_windows())
+        if not matches:
+            return None
+        by_class: dict[str, list] = {}
+        for w in matches:
+            by_class.setdefault(w.cls.lower() or w.title.lower(), []).append(w)
+        if len(by_class) > 1 and not confirmed_index:
+            return outcome.ask(
+                "close_app",
+                f"more than one application has a window matching '{app_name}': "
+                f"{', '.join(list(by_class)[:4])} - which one should be closed?",
+                app=app_name, candidates=len(by_class))
+        group = next(iter(by_class.values()))
+        closed, still_open = hyprland.close_windows(group)
+    except hyprland.HyprlandError as e:
+        return outcome.failed("close_app", e.cause + (f" - {e.fix}" if e.fix else ""),
+                              app=app_name)
+    name = group[0].label()
+    if closed and not still_open:
+        return outcome.done("close_app", app=app_name, closed=name,
+                            windows=len(closed), verified=True)
+    if closed:
+        return outcome.unverified(
+            "close_app",
+            f"{len(closed)} of {len(group)} windows closed; the rest are still "
+            f"open - the application may be asking to save something",
+            app=app_name, closed=name)
+    return outcome.unverified(
+        "close_app",
+        "the window was asked to close and is still open - the application may "
+        "be asking to save something",
+        app=app_name, matched=name)
+
+
 def _close_app(app_name: str, confirmed_index: int | None = None) -> str:
     """Close the application the user named — that one, and never this one.
 
@@ -365,6 +434,11 @@ def _close_app(app_name: str, confirmed_index: int | None = None) -> str:
     app_name = (app_name or "").strip()
     if not app_name:
         return outcome.failed("close_app", "no application name was given")
+
+    if hyprland.active():
+        by_window = _close_app_windows(app_name, confirmed_index)
+        if by_window is not None:
+            return by_window
 
     if not appidentity._PSUTIL:
         return outcome.failed(
@@ -456,6 +530,19 @@ def _close_app(app_name: str, confirmed_index: int | None = None) -> str:
     )
 
 
+def _list_windows() -> str:
+    if not hyprland.active():
+        return outcome.failed(
+            "list_windows", "listing windows is only available in a Hyprland session")
+    try:
+        mine = hyprland.own_pids()
+        rows = [f"{w.cls or '?'} | {w.title[:60]} | workspace {w.workspace}"
+                for w in hyprland.list_windows() if w.pid not in mine]
+    except hyprland.HyprlandError as e:
+        return outcome.failed("list_windows", e.cause + (f" - {e.fix}" if e.fix else ""))
+    return "Open windows:\n" + "\n".join(rows) if rows else "No other windows are open."
+
+
 def _screen_find(description: str) -> tuple[int, int] | None:
     api_key = _get_api_key()
     if not api_key:
@@ -544,6 +631,7 @@ def computer_control(
       wait          — sleep N seconds
       clear_field   — select-all + delete
       focus_window  — bring window to foreground
+      list_windows  — Hyprland only: the open windows (class | title | workspace)
       screen_find   — AI element finder (returns x,y)
       screen_click  — AI element finder + click
       random_data   — generate fake form data
@@ -624,7 +712,9 @@ def computer_control(
             coords = _screen_find(desc)
             if coords:
                 time.sleep(0.2)
-                _click(x=coords[0], y=coords[1])
+                clicked = _click(x=coords[0], y=coords[1])
+                if hyprland.active():
+                    return clicked
                 return f"Clicked '{desc}' at {coords}"
             return f"Element not found on screen: '{desc}'"
 
@@ -639,6 +729,9 @@ def computer_control(
 
         if action == "focus_window":
             return _focus_window(params.get("title", ""))
+
+        if action == "list_windows":
+            return _list_windows()
 
         if action in ("close_app", "close_application", "quit_app"):
             return _close_app(
@@ -663,6 +756,9 @@ def computer_control(
 
         return f"Unknown action: '{action}'"
 
+    except hyprland.HyprlandError as e:
+        print(f"[ComputerControl] ❌ {action}: {e}")
+        return outcome.failed(action, e.cause + (f" - {e.fix}" if e.fix else ""))
     except Exception as e:
         print(f"[ComputerControl] ❌ {action}: {e}")
         return f"computer_control '{action}' failed: {e}"
@@ -694,7 +790,7 @@ TOOL = {
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "type | smart_type | click | double_click | right_click | hotkey | press | scroll | move | copy | paste | screenshot | wait | clear_field | focus_window | close_app | screen_find | screen_click | random_data | user_data"
+                "description": "type | smart_type | click | double_click | right_click | hotkey | press | scroll | move | copy | paste | screenshot | wait | clear_field | focus_window | list_windows | close_app | screen_find | screen_click | random_data | user_data"
             },
             "app_name": {
                 "type": "STRING",

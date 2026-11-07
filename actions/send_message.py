@@ -5,7 +5,7 @@ import threading
 import time
 from pathlib import Path
 
-from core import outcome
+from core import hyprland, outcome
 from core.lazyimport import LazyModule, installed
 
 # Imported on first USE, not at launch — see core/lazyimport.py. PAUSE is 0.06
@@ -20,7 +20,7 @@ def _configure_pyautogui(module) -> None:
     module.PAUSE    = 0.06
 
 
-pyautogui = LazyModule("pyautogui", _configure_pyautogui)
+pyautogui = hyprland.AutoGuiProxy(LazyModule("pyautogui", _configure_pyautogui))
 pyperclip = LazyModule("pyperclip")
 
 def _base_dir() -> Path:
@@ -39,6 +39,8 @@ def _get_os() -> str:
 
 
 def _require_pyautogui():
+    if hyprland.active():
+        return
     if not _PYAUTOGUI:
         raise RuntimeError("PyAutoGUI not installed. Run: pip install pyautogui")
 
@@ -331,7 +333,7 @@ def send_message(
     if not message_text:
         return outcome.failed("send_message", "no message text was given",
                               to=receiver)
-    if not _PYAUTOGUI:
+    if not _PYAUTOGUI and not hyprland.active():
         return outcome.failed(
             "send_message",
             "PyAutoGUI is not installed, so the desktop cannot be driven - "

@@ -214,6 +214,27 @@ Wayland — the default session on Ubuntu 22.04 and later, on Fedora, and on cur
 
 None of that is fixable from inside the app. What was fixable is the silence. The session is detected at startup, the user is told once in the activity log, and — the half that matters — the **model is told**, so JARVIS says "this session does not permit me to drive the screen" instead of narrating a click that never happened. Voice, memory, files, the web and opening applications are unaffected, and are not mentioned.
 
+### 🪟 Hyprland is the exception
+
+Hyprland has its own control surface, so on it the assistant does **not** claim it is locked out. `core/hyprland.py` drives the session with four small tools, and each capability is reported only when its tool is there:
+
+| It can | Through | Needs |
+|---|---|---|
+| See the screen (and a region) | `grim` (+ `slurp` to pick a region) | `grim` |
+| Type and press key combinations | `wtype` | `wtype` |
+| List, focus and close windows; place the cursor | `hyprctl` | `hyprctl` (comes with Hyprland) |
+| **Click** | `ydotool` | `ydotool` **and** the `ydotoold` service answering |
+
+Closing a browser or an app now closes its **windows** (`closewindow`, the polite request, never a kill) and answers with what actually went away; the assistant's own window and the terminal it runs in are never candidates. Scrolling with the wheel and dragging are not available, and the assistant says so.
+
+**Click depends on `ydotoold`.** Without it, click is declared absent to the model, with the reason, and a click request fails instead of reporting success. To turn it on:
+
+```bash
+systemctl --user enable --now ydotool
+```
+
+The activity log at startup lists what works and what does not. A click cannot be read back from the screen, so it is reported as sent-but-unconfirmed. GNOME, KDE and other Wayland compositors behave as described in the section above. Both the Lua (`hl.dsp…`) and the older `hyprctl dispatch` syntax are understood. Self-test, no compositor needed: `python -m core._hyprland_tests`.
+
 ### 🎧 The audio panel can prove it hears you
 
 Every automated probe in `core/audio_devices.py` runs on silence, which is what lets it run at startup without anyone noticing. It also means a muted microphone, a level slider at zero and a privacy shutter all pass every test and deliver a flat line. Only a person speaking can settle that.
