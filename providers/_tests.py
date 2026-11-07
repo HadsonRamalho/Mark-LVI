@@ -1073,6 +1073,563 @@ def test_panel_settings_survive():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Claude: the `claude` command as a provider and as a tool
+# ─────────────────────────────────────────────────────────────────────────────
+# A FAKE `claude` stands in for the real one. The real one spends the owner's
+# subscription, shares its usage window with other tools, and answers
+# differently every time — none of which an automated test may do. The fake is a
+# script written into a temp folder and put first on PATH, so the code under
+# test finds it the way it finds the real binary. Its behaviour is chosen by an
+# environment variable, and it records what it was called with.
+_FAKE_CLAUDE = r'''#!{python}
+import json, os, sys, time
+mode = os.environ.get("FAKE_CLAUDE_MODE", "ok")
+args = sys.argv[1:]
+rec = os.environ.get("FAKE_CLAUDE_REC")
+if args[:2] == ["auth", "status"]:
+    print(json.dumps({{"loggedIn": mode != "loggedout"}}))
+    sys.exit(0)
+prompt = sys.stdin.read()
+if rec:
+    with open(rec, "a") as f:
+        f.write(json.dumps({{"args": args, "stdin": prompt, "pid": os.getpid(),
+                            "api_key": os.environ.get("ANTHROPIC_API_KEY"),
+                            "cwd": os.getcwd()}}) + "\n")
+def emit(o):
+    print(json.dumps(o), flush=True)
+sid = "sess-123"
+emit({{"type": "system", "subtype": "init", "session_id": sid}})
+print("not json: a warning on stdout", flush=True)
+if mode == "sleep":
+    time.sleep(60)
+if mode == "crash":
+    sys.stderr.write("boom: something broke inside the cli\n")
+    sys.exit(3)
+def result(text, is_error=False):
+    emit({{"type": "result", "subtype": "error" if is_error else "success",
+          "is_error": is_error, "result": text, "session_id": sid,
+          "total_cost_usd": 0.0123, "duration_ms": 4321, "num_turns": 2}})
+if mode == "login":
+    result("Invalid API key · Please run /login", True)
+elif mode == "limit":
+    result("Claude AI usage limit reached|1760000000", True)
+elif mode == "question":
+    emit({{"type": "assistant", "message": {{"content": [
+        {{"type": "text", "text": "<question>Which folder?</question>"}}]}}}})
+    result("<question>Which folder?</question>")
+elif mode == "empty":
+    result("")
+elif mode == "plain":
+    result("Just an answer with no tags.")
+else:
+    emit({{"type": "assistant", "message": {{"content": [
+        {{"type": "tool_use", "name": "Read", "input": {{}}}}]}}}})
+    result("<speech>It is done.</speech><report># Report\n\nFull details here.</report>")
+'''
+
+
+class _FakeClaude:
+    """A fake `claude` first on PATH, an isolated config and data folder, and a
+    log of every call. Everything is put back on exit — including the config,
+    which this never writes to the real file."""
+
+    def __init__(self):
+        import tempfile
+        self.dir = Path(tempfile.mkdtemp(prefix="fake-claude-"))
+        self.rec = self.dir / "calls.jsonl"
+
+    def __enter__(self):
+        import os
+        import stat
+
+        import memory.config_manager as cm
+        from providers import llm_claude, registry
+
+        exe = self.dir / "bin" / "claude"
+        exe.parent.mkdir()
+        exe.write_text(_FAKE_CLAUDE.format(python=sys.executable))
+        exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
+
+        self._env = {k: os.environ.get(k) for k in
+                     ("PATH", "FAKE_CLAUDE_MODE", "FAKE_CLAUDE_REC",
+                      "ANTHROPIC_API_KEY")}
+        os.environ["PATH"] = f"{exe.parent}{os.pathsep}{os.environ['PATH']}"
+        os.environ["FAKE_CLAUDE_REC"] = str(self.rec)
+        # A key that would silently move the bill off the subscription.
+        os.environ["ANTHROPIC_API_KEY"] = "sk-test-must-not-reach-the-child"
+
+        self._cm = (cm.CONFIG_FILE, cm.CONFIG_DIR)
+        cm.CONFIG_DIR = self.dir / "config"
+        cm.CONFIG_FILE = cm.CONFIG_DIR / "api_keys.json"
+        self._data = llm_claude.DATA_DIR
+        llm_claude.DATA_DIR = self.dir / "data"
+        registry.reset()
+        return self
+
+    def mode(self, mode: str) -> None:
+        import os
+        os.environ["FAKE_CLAUDE_MODE"] = mode
+
+    def calls(self) -> list[dict]:
+        if not self.rec.exists():
+            return []
+        return [json.loads(x) for x in self.rec.read_text().splitlines() if x]
+
+    def __exit__(self, *exc):
+        import os
+        import shutil
+
+        import memory.config_manager as cm
+        from providers import llm_claude, registry
+        for k, v in self._env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        cm.CONFIG_FILE, cm.CONFIG_DIR = self._cm
+        llm_claude.DATA_DIR = self._data
+        registry.reset()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
+def _wait(cond, seconds: float = 8.0) -> bool:
+    import time
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if cond():
+            return True
+        time.sleep(0.05)
+    return cond()
+
+
+def test_claude_command_and_stream():
+    section("[11] Claude: the command and what it prints")
+    from providers import llm_claude as lc
+
+    cli = lc.ClaudeCLI({"model": "opus", "permission_mode": "acceptEdits"})
+    cmd = cli.build_command("/x/claude", system="SYS", resume="abc")
+    check("it is an argument list, not a shell string", isinstance(cmd, list))
+    check("print mode with stream-json and verbose",
+          cmd[:6] == ["/x/claude", "-p", "--output-format", "stream-json",
+                      "--verbose", "--permission-mode"], str(cmd))
+    check("permission mode and model are passed",
+          "acceptEdits" in cmd and cmd[cmd.index("--model") + 1] == "opus")
+    check("the system text is appended, not replacing the default",
+          cmd[cmd.index("--append-system-prompt") + 1] == "SYS")
+    check("a session is resumed by id", cmd[cmd.index("--resume") + 1] == "abc")
+    plain = lc.ClaudeCLI({}).build_command("/x/claude", system="S",
+                                           replace_system=True, plain=True)
+    check("a plain generation has no tools and leaves no session",
+          plain[plain.index("--tools") + 1] == ""
+          and "--no-session-persistence" in plain, str(plain))
+    check("and replaces the system text", "--system-prompt" in plain)
+    check("the default permission mode is the read-only one",
+          lc.ClaudeCLI({}).permission_mode == "default")
+
+    check("a stream line is parsed",
+          (lc.parse_stream_line('{"type": "result", "result": "x"}') or {}
+           ).get("result") == "x")
+    check("a warning on stdout is skipped, not fatal",
+          lc.parse_stream_line("warning: something") is None
+          and lc.parse_stream_line("{broken") is None
+          and lc.parse_stream_line("[1, 2]") is None)
+
+    check("a login failure is recognised",
+          lc.classify_failure("Invalid API key · Please run /login") == "login")
+    check("a usage limit is recognised",
+          lc.classify_failure("Claude AI usage limit reached|1760000000") == "limit")
+    check("anything else is just a failure",
+          lc.classify_failure("the model went away") == "failed")
+
+    system, prompt = lc.flatten_messages([
+        {"role": "system", "content": "be brief"},
+        {"role": "user", "content": "hi"}])
+    check("one user message goes through untouched",
+          (system, prompt) == ("be brief", "hi"))
+    _, prompt = lc.flatten_messages([
+        {"role": "user", "content": "a"}, {"role": "assistant", "content": "b"},
+        {"role": "user", "content": "c"}])
+    check("a longer exchange becomes a transcript",
+          prompt == "User: a\n\nAssistant: b\n\nUser: c", repr(prompt))
+    try:
+        lc.flatten_messages([{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:,"}}]}])
+        check("an image is refused, not dropped", False)
+    except lc.ClaudeError as e:
+        check("an image is refused, not dropped", e.kind == "unsupported")
+
+
+def test_claude_runs_and_fails_in_words():
+    import os
+    section("[12] Claude: it runs, and when it cannot it says why")
+    from providers import llm_claude as lc
+
+    with _FakeClaude() as fake:
+        logged: list[str] = []
+        cli = lc.ClaudeCLI({"timeout": 30, "log": logged.append})
+
+        fake.mode("ok")
+        seen: list[str] = []
+        res = cli.run("what is up", system="S",
+                      on_event=lambda e: seen.append(e.get("type")))
+        call = fake.calls()[-1]
+        check("the answer and the session id come back",
+              res.session_id == "sess-123" and "It is done." in res.text)
+        check("the cost and time the stream reports are kept",
+              res.cost_usd == 0.0123 and res.duration_ms == 4321
+              and res.num_turns == 2)
+        check("the prompt travels on stdin, not on the command line",
+              call["stdin"] == "what is up" and "what is up" not in call["args"])
+        check("a key in the environment is not handed to the child",
+              call["api_key"] is None)
+        check("it runs in its own folder, not in this repository",
+              call["cwd"] != os.getcwd() and "claude" in call["cwd"], call["cwd"])
+        check("the stream is observable while it runs",
+              "assistant" in seen and "result" in seen, str(seen))
+
+        fake.mode("plain")
+        check("a reply with no tags is still an answer",
+              "no tags" in cli.run("x").text)
+
+        for mode, kind, words in (("login", "login", "claude auth login"),
+                                  ("limit", "limit", "usage limit"),
+                                  ("empty", "empty", "nothing")):
+            fake.mode(mode)
+            try:
+                cli.run("x")
+                check(f"{mode}: raises", False)
+            except lc.ClaudeError as e:
+                check(f"{mode}: kind and an action in the message",
+                      e.kind == kind and words in str(e).lower(), f"{e.kind}: {e}")
+
+        fake.mode("crash")
+        logged.clear()
+        try:
+            cli.run("x")
+            check("a crash raises", False)
+        except lc.ClaudeError as e:
+            check("a crash raises with the reason", e.kind == "failed", str(e))
+        check("its stderr is logged, never discarded",
+              any("boom" in x for x in logged), str(logged))
+
+        # timeout: the child is stopped, not abandoned
+        import time
+        fake.mode("sleep")
+        t0 = time.monotonic()
+        try:
+            cli.run("x", timeout=1)
+            check("a hung run times out", False)
+        except lc.ClaudeError as e:
+            took = time.monotonic() - t0
+            check("a hung run times out, quickly, naming the limit",
+                  e.kind == "timeout" and took < 8 and "1 seconds" in str(e),
+                  f"{e.kind} {took:.1f}s {e}")
+        pid = fake.calls()[-1]["pid"]
+
+        def gone():
+            try:
+                os.kill(pid, 0)
+                return False
+            except OSError:
+                return True
+        check("and the process is really gone", _wait(gone, 4.0))
+
+        # cancellation
+        ev = threading.Event()
+        threading.Timer(0.5, ev.set).start()
+        t0 = time.monotonic()
+        try:
+            cli.run("x", cancel=ev, timeout=30)
+            check("a cancelled run stops", False)
+        except lc.ClaudeError as e:
+            check("a cancelled run stops at once",
+                  e.kind == "cancelled" and time.monotonic() - t0 < 6, e.kind)
+
+        # the CLI not being there at all
+        real = lc.find_claude
+        lc.find_claude = lambda: ""
+        try:
+            cli.run("x")
+            check("a missing CLI raises", False)
+        except lc.ClaudeError as e:
+            check("a missing CLI says to install it",
+                  e.kind == "missing" and "install" in str(e).lower(), str(e))
+        finally:
+            lc.find_claude = real
+        check("find_claude finds it on PATH",
+              lc.find_claude().endswith("claude") and "fake-claude-" in lc.find_claude())
+
+        fake.mode("ok")
+        ok, msg = cli.probe()
+        check("TEST costs nothing: it asks for login state, sends no prompt",
+              ok and not any(c["stdin"] for c in fake.calls()[-1:] if False), msg)
+        n = len(fake.calls())
+        cli.probe()
+        check("TEST left no prompt call behind", len(fake.calls()) == n)
+        fake.mode("loggedout")
+        ok, msg = cli.probe()
+        check("TEST says to log in when it is not", not ok and "login" in msg.lower(), msg)
+
+
+def test_claude_is_routable_by_config():
+    section("[13] Claude: routed by configuration, off by default")
+    from core import llm_client
+    from memory.config_manager import (get_claude_settings, save_claude_settings,
+                                       save_provider_config)
+    from providers import registry
+
+    with _FakeClaude() as fake:
+        fake.mode("plain")
+        s = get_claude_settings()
+        check("it is off by default", s["enabled"] is False)
+        check("its defaults are 5 minutes, 6 lines, read only",
+              (s["timeout"], s["turns"], s["permission_mode"])
+              == (300, 6, "default"), str(s))
+        check("routing is None while it is off", llm_client.claude_route() is None)
+
+        class _Reached(Exception):
+            pass
+
+        def _local(*a, **k):
+            raise _Reached()
+
+        real_post = llm_client.requests.post
+        llm_client.requests.post = _local
+        try:
+            try:
+                llm_client.call_llm_text("hello")
+                check("off: the local model is asked, as before", False)
+            except Exception as e:
+                check("off: the local model is asked, as before",
+                      isinstance(getattr(e, "__cause__", None), _Reached)
+                      or "_Reached" in repr(e) or "failed" in str(e), repr(e))
+            check("off: the CLI was not called", fake.calls() == [])
+
+            save_claude_settings(enabled=True, model="sonnet")
+            check("on: routing returns the provider",
+                  llm_client.claude_route() is not None)
+            out = llm_client.call_llm_text("hello", system="be terse",
+                                           model="llama3.2")
+            call = fake.calls()[-1]
+            check("on: the text comes from Claude", out == "Just an answer with no tags.", out)
+            check("on: the local model name is not sent to Claude",
+                  "llama3.2" not in call["args"]
+                  and call["args"][call["args"].index("--model") + 1] == "sonnet")
+            check("on: it is a plain generation, no tools",
+                  "--tools" in call["args"] and call["stdin"] == "hello")
+            check("on: the system text is passed",
+                  call["args"][call["args"].index("--system-prompt") + 1] == "be terse")
+        finally:
+            llm_client.requests.post = real_post
+
+        # the existing background-request ladder reaches it with no new code
+        from core import gemini
+        txt = gemini._provider_call("prov:llm_claude", "ping", None, 20000).text
+        check("core/gemini's provider rung can use it too",
+              txt == "Just an answer with no tags.", txt)
+
+        decls = {d["id"]: d for d in registry.discover("llm")}
+        check("it is registered by name beside the others",
+              "llm_claude" in decls and "openai_compat" in decls, str(list(decls)))
+        check("it needs no key field",
+              not any(f.kind == "secret" for f in decls["llm_claude"]["needs"]))
+        check("nothing is missing for it", registry.missing_fields("llm_claude", {}) == [])
+
+
+def test_claude_task_context_and_report():
+    section("[14] claude_task: what Claude is sent, and what comes back")
+    from actions import claude_task as ct
+    from memory.config_manager import save_claude_settings
+
+    heard = "monta um relatório de todos os PRs abertos do repositório"
+    hint = "gera um relatório de pull requests"
+    prompt = ct.build_prompt(heard, hint, ["User: oi", "JARVIS: olá"])
+    i_heard, i_turns, i_hint = (prompt.index(heard), prompt.index("User: oi"),
+                                prompt.index(hint))
+    check("the transcript comes first, then the conversation, then the hint",
+          i_heard < i_turns < i_hint, f"{i_heard} {i_turns} {i_hint}")
+    check("the paraphrase is marked as a hint",
+          "HINT" in prompt and "trust the words" in prompt)
+    check("with no transcript it says so and keeps the paraphrase",
+          "No transcript" in ct.build_prompt("", hint, [])
+          and hint in ct.build_prompt("", hint, []))
+    check("an answer is marked as one",
+          "answering the question" in ct.build_prompt("sim", "", [], answering=True))
+    check("the last N lines, newest kept",
+          ct.trim_turns(["a", "b", "c", "d"], "", 2) == ["c", "d"])
+    check("the request itself is not repeated as history",
+          ct.trim_turns(["User: x", "User: faz isso"], "faz isso", 5) == ["User: x"])
+    check("zero lines means none", ct.trim_turns(["a"], "", 0) == [])
+
+    a = ct.parse_answer("<speech>Feito.</speech><report># R\n\nbody</report>")
+    check("speech and report are split",
+          a["speech"] == "Feito." and a["report"].startswith("# R") and not a["question"])
+    check("a question is recognised",
+          ct.parse_answer("<question>Qual pasta?</question>")["question"] == "Qual pasta?")
+    b = ct.parse_answer("Pronto. " + "detalhe " * 30)
+    check("untagged text: first sentence is spoken, all of it is the report",
+          b["speech"] == "Pronto." and len(b["report"]) > 100, str(b))
+    check("a short untagged answer needs no report",
+          ct.parse_answer("Pronto.")["report"] == "")
+    check("a transcript and a paraphrase that match score 1.0, others less",
+          ct.similarity("abre o app", "abre o app") == 1.0
+          and ct.similarity(heard, hint) < 0.7)
+
+    with _FakeClaude() as fake:
+        spoken: list[str] = []
+        panel: list[tuple] = []
+        logs: list[str] = []
+
+        class _Player:
+            def write_log(self, t): logs.append(t)
+            def show_content(self, title, text): panel.append((title, text))
+
+        convo = lambda: {"heard": heard, "turns": ["User: oi", "JARVIS: olá",
+                                                   f"User: {heard}"]}
+        params = {"request": hint}
+
+        r = ct.claude_task(params, _Player(), spoken.append, convo)
+        check("off: it says so and starts nothing",
+              "switched off" in r and fake.calls() == [])
+
+        save_claude_settings(enabled=True, turns=2)
+        fake.mode("ok")
+        import time
+        t0 = time.monotonic()
+        r = ct.claude_task(params, _Player(), spoken.append, convo)
+        check("run() returns at once with a started note",
+              time.monotonic() - t0 < 2 and r.startswith("[STARTED]"), r)
+        check("a second request while one runs is turned away",
+              ct.claude_task(params, _Player(), spoken.append, convo)
+              .startswith("[BUSY]") or fake.calls() != [])
+        check("the result arrives through the session", _wait(lambda: bool(spoken)))
+        check("the task thread released the lock",
+              _wait(lambda: not ct._running))
+
+        call = fake.calls()[0]
+        check("Claude was sent the transcript first",
+              call["stdin"].index(heard) < call["stdin"].index(hint))
+        check("and only the last 2 lines before it, without repeating it",
+              "JARVIS: olá" in call["stdin"] and "User: oi" in call["stdin"]
+              and call["stdin"].count(heard) == 1, call["stdin"])
+        check("the format instruction was appended to the system prompt",
+              "<speech>" in call["args"][call["args"].index("--append-system-prompt") + 1])
+
+        msg = spoken[0]
+        check("the voice is handed the sentence",
+              msg.startswith("[CLAUDE_DONE]") and "It is done." in msg, msg)
+        check("and told not to read the report",
+              "Do NOT read" in msg and "Full details here" not in msg)
+        check("the report is on the panel, whole, with where it is saved",
+              bool(panel) and "Full details here" in panel[0][1]
+              and "Saved:" in panel[0][1], str(panel))
+        reports = list((fake.dir / "data" / "reports").glob("*.md"))
+        check("the report is a file", len(reports) == 1
+              and "Full details here" in reports[0].read_text(), str(reports))
+        check("the cost is shown in the activity log",
+              any("$0.0123" in x for x in logs), str(logs))
+
+        lines = [json.loads(x) for x in
+                 (fake.dir / "data" / "requests.jsonl").read_text().splitlines()]
+        req = next(x for x in lines if x["event"] == "request")
+        check("the measurement log has the transcript and the paraphrase",
+              req["heard"] == heard and req["paraphrase"] == hint
+              and 0 <= req["similarity"] < 1, str(req))
+        check("and what the task cost",
+              any(x["event"] == "done" and x["cost_usd"] == 0.0123 for x in lines))
+
+        # a question comes back, and its answer resumes the same session
+        spoken.clear()
+        fake.mode("question")
+        ct.claude_task(params, _Player(), spoken.append, convo)
+        check("a question is spoken for the Live model to ask",
+              _wait(lambda: bool(spoken)) and spoken[0].startswith("[CLAUDE_QUESTION]")
+              and "Which folder?" in spoken[0], str(spoken))
+        _wait(lambda: not ct._running)
+        spoken.clear()
+        fake.mode("ok")
+        n = len(fake.calls())
+        ct.claude_task({"request": "downloads", "answering": True}, _Player(),
+                       spoken.append,
+                       lambda: {"heard": "a pasta downloads", "turns": []})
+        _wait(lambda: bool(spoken))
+        again = fake.calls()[n]
+        check("the answer resumes the same Claude session",
+              "--resume" in again["args"]
+              and again["args"][again["args"].index("--resume") + 1] == "sess-123")
+        check("and carries what the owner said", "a pasta downloads" in again["stdin"]
+              and "answering the question" in again["stdin"])
+        _wait(lambda: not ct._running)
+
+        # failure reaches the voice in words
+        spoken.clear()
+        fake.mode("login")
+        ct.claude_task(params, _Player(), spoken.append, convo)
+        check("a failure is spoken with its remedy",
+              _wait(lambda: bool(spoken)) and spoken[0].startswith("[CLAUDE_FAILED]")
+              and "claude auth login" in spoken[0], str(spoken))
+        _wait(lambda: not ct._running)
+
+        # and a task can be cancelled by voice
+        fake.mode("sleep")
+        spoken.clear()
+        ct.claude_task(params, _Player(), spoken.append, convo)
+        _wait(lambda: len(fake.calls()) >= 5)
+        check("stop cancels the running task",
+              "Cancelled" in ct.claude_task({"stop": True}, _Player(), spoken.append, convo))
+        check("the task ends", _wait(lambda: not ct._running, 6.0))
+        check("a cancelled task does not announce a failure",
+              not any("CLAUDE_FAILED" in s for s in spoken), str(spoken))
+
+
+def test_claude_wiring_in_main():
+    section("[15] Claude: wired into the session and the prompt")
+    src = (Path(__file__).resolve().parent.parent / "main.py").read_text(
+        encoding="utf-8").replace("\r\n", "\n")
+    check("the tool is handed the conversation",
+          '"conversation": self._conversation_snapshot' in src)
+    check("the transcript is kept as it arrives",
+          "self._heard_text = " in src.split("txt = _clean_transcript(sc.input_transcription.text)")[1][:600])
+    check("the tool is withheld while Claude is off",
+          "get_claude_enabled()" in src and '!= "claude_task"' in src)
+
+    prompt = (Path(__file__).resolve().parent.parent / "core" / "prompt.txt"
+              ).read_text(encoding="utf-8").replace("\r\n", "\n")
+    check("the prompt carries the delegation rules in a conditional block",
+          "{if:claude_task}" in prompt and "{/if}" in prompt
+          and "answering=true" in prompt)
+
+    import re as _re
+    block = _re.compile(r"\{if:([A-Za-z0-9_]+)\}[ \t]*\n?(.*?)\{/if\}[ \t]*\n?", _re.S)
+    keep = lambda names: block.sub(
+        lambda m: m.group(2) if m.group(1) in names else "", prompt)
+    check("with the tool the rules are in the prompt",
+          "DELEGATING TO CLAUDE" in keep({"claude_task"}))
+    check("without it the prompt says nothing about Claude",
+          "claude_task" not in keep(set()) and "{if:" not in keep(set()))
+    check("main.py renders it by the same pattern",
+          block.pattern in src.replace("\\\\", "\\") or "_IF_BLOCK" in src)
+
+    # the loader hands `conversation` to a handler that declares it
+    from core.action_loader import _CTX_KEYS, _call_handler
+    check("the action loader passes `conversation`", "conversation" in _CTX_KEYS)
+    got = {}
+    _call_handler(lambda parameters, conversation=None: got.update(c=conversation),
+                  {}, {"conversation": "X"})
+    check("and a handler that does not declare it is unaffected",
+          got == {"c": "X"} and _call_handler(lambda parameters: "ok", {},
+                                              {"conversation": "X"}) == "ok")
+
+    # the tool is discovered like any action
+    from core.action_loader import discover_actions
+    reg = discover_actions(Path(__file__).resolve().parent.parent / "actions")
+    check("claude_task is discovered as an action", reg.has("claude_task"))
+    decl = next(d for d in reg.get_tool_declarations() if d["name"] == "claude_task")
+    check("its description leads with the rules (the prompt keeps 150 characters)",
+          "Say only the short line" in decl["description"][:260])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 async def main() -> int:
     print("providers self-test")
     await test_real_caller_shapes()
@@ -1093,6 +1650,13 @@ async def main() -> int:
     test_voices_follow_the_language()
     test_voice_folder_is_writable()
     test_a_chosen_voice_downloads_itself()
+    # Before the panel test: it leaves Qt objects behind, and a garbage
+    # collection that lands later has segfaulted whatever test runs next.
+    test_claude_command_and_stream()
+    test_claude_runs_and_fails_in_words()
+    test_claude_is_routable_by_config()
+    test_claude_task_context_and_report()
+    test_claude_wiring_in_main()
     test_panel_settings_survive()
 
     print(f"\n{'=' * 56}")

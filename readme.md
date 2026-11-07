@@ -235,6 +235,24 @@ systemctl --user enable --now ydotool
 
 The activity log at startup lists what works and what does not. A click cannot be read back from the screen, so it is reported as sent-but-unconfirmed. GNOME, KDE and other Wayland compositors behave as described in the section above. Both the Lua (`hl.dsp…`) and the older `hyprctl dispatch` syntax are understood. Self-test, no compositor needed: `python -m core._hyprland_tests`.
 
+### 🧠 Claude does the work, Gemini Live keeps the voice
+
+For anything that is not trivial — a multi-step action, a plan, a written report — the assistant can hand the request to **Claude** through the `claude` command you are already logged into. The voice model stays the ear and the mouth.
+
+**Needs:** `claude` (Claude Code) on the `PATH` and logged in (`claude auth login`). There is no API key to enter: the work is billed to your Claude plan, and a stray `ANTHROPIC_API_KEY` in the environment is removed for the child so it cannot move the bill.
+
+**Turn it on:** CONTROLS drawer → `CLAUDE: ON` (the session reconnects and keeps the conversation). `CLAUDE TIME` is how long one task may run, `CLAUDE LINES` how many earlier spoken lines go with each request. Off by default; with it off, nothing about it is offered to the model.
+
+**What it does:** the new `claude_task` tool sends Claude what you *said* — the literal speech transcription plus the last few lines of the conversation — and the voice model's own paraphrase only as a marked hint. Claude answers with a spoken sentence and a full report. The assistant says the sentence and where the report is; the report goes to the panel under the head and to `memory/claude/reports/*.md`, and is never read aloud. If Claude asks a question, the assistant asks you, and your answer resumes the same Claude session. Say "cancel" to stop a running task.
+
+**It is read-only by default.** Claude runs in `memory/claude/work` with the CLI's `default` permission mode, so a misheard sentence cannot edit a file. The provider form (Settings → providers → *Claude*) has a *Permissions* field with `acceptEdits` and `plan`, and a work folder under MORE.
+
+**Measuring the transcription:** every request appends one line to `memory/claude/requests.jsonl` — what was heard, what the voice model paraphrased, a 0–1 similarity, and later the cost and time of the task. Text only, no audio. Read twenty of your own requests and you can tell whether the transcription is good enough or whether the listening needs replacing.
+
+**Background requests too:** with Claude on, `core.llm_client.call_llm_text` goes to Claude instead of the local model, and *Claude* can be picked as the provider for background requests in the providers panel.
+
+**To test by voice:** turn it on, then say something like "write me a report of the open pull requests in this repository". Expect one short spoken acknowledgement, activity-log lines while it works, then a sentence and the report on screen. `python -m providers._tests` covers all of this with a fake `claude`, so it spends nothing.
+
 ### 🎧 The audio panel can prove it hears you
 
 Every automated probe in `core/audio_devices.py` runs on silence, which is what lets it run at startup without anyone noticing. It also means a muted microphone, a level slider at zero and a privacy shutter all pass every test and deliver a flat line. Only a person speaking can settle that.
@@ -603,6 +621,7 @@ Mark LVI/
 │   ├── schema.py             # Tool declarations: Gemini <-> OpenAI <-> Anthropic, and the budget
 │   ├── audio.py              # Rates and formats — 16 kHz in, 24 kHz out, everything between
 │   ├── llm_openai.py         # Every /v1/chat/completions endpoint: local servers and hosted APIs
+│   ├── llm_claude.py         # The `claude` command as a model — your subscription, no API key
 │   ├── stt_whisper.py        # Whisper on the CPU, or a transcription API
 │   ├── tts_piper.py          # Neural voice here, ~50 languages, follows the one you speak
 │   ├── tts_system.py         # Windows SAPI / macOS say / Linux espeak-ng — nothing to download
@@ -630,6 +649,7 @@ Mark LVI/
 │   ├── excel_writer.py       # Spreadsheet output
 │   ├── code_helper.py        # Write and run small programs
 │   ├── dev_agent.py          # Multi-file project work
+│   ├── claude_task.py        # Hands non-trivial requests to Claude; report to a file and the panel
 │   ├── image_generator.py    # Generate images
 │   ├── upload_video.py       # Upload the video on your Desktop to YouTube
 │   ├── youtube_video.py      # Search, summarise and fetch transcripts

@@ -36,7 +36,7 @@ from typing import Callable, Optional
 
 _NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
 _DEFAULT_PARAMS = {"type": "OBJECT", "properties": {}}
-_CTX_KEYS = ("player", "speak", "response", "session_memory")
+_CTX_KEYS = ("player", "speak", "response", "session_memory", "conversation")
 
 
 # A tool may declare that the model should NOT be held up waiting for it.
