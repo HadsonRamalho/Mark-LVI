@@ -328,6 +328,26 @@ def call_llm(
         raise RuntimeError(f"LLM call failed: {e}")
 
 
+def claude_route():
+    """The Claude provider when the owner turned it on, else None.
+
+    Off unless switched on in CONTROLS, so an install that never does keeps
+    calling the local model exactly as before. Nothing from `providers` is
+    imported while it is off."""
+    try:
+        from memory.config_manager import (CLAUDE_PROVIDER_ID,
+                                           get_claude_settings,
+                                           get_provider_config)
+        if not get_claude_settings()["enabled"]:
+            return None
+        from providers import registry
+        return registry.build(CLAUDE_PROVIDER_ID,
+                              get_provider_config(CLAUDE_PROVIDER_ID))
+    except Exception as e:
+        print(f"[LLM] Claude is on but could not be used: {e}")
+        return None
+
+
 def call_llm_text(
     prompt:  str,
     system:  str | None = None,
@@ -337,15 +357,27 @@ def call_llm_text(
     """
     Simple text-only generation (no tools).
     Used by planner, executor, error_handler, code_helper, dev_agent.
+    Goes to the `claude` command instead of the local model while Claude is
+    switched on in CONTROLS.
     """
-    url, default_model = get_llm_settings()
-    endpoint = f"{url}/api/chat"
-    m        = model or default_model
-
     messages: list[dict] = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
+
+    claude = claude_route()
+    if claude is not None:
+        # `model` is a name on the local server (llama3.2) and means nothing to
+        # Claude, so it is not passed; the model Claude uses is its own setting.
+        try:
+            text, _ = claude.complete(messages, timeout=timeout)
+            return text.strip()
+        except Exception as e:
+            raise RuntimeError(f"Claude text call failed: {e}")
+
+    url, default_model = get_llm_settings()
+    endpoint = f"{url}/api/chat"
+    m        = model or default_model
 
     payload = {"model": m, "messages": messages, "stream": False, "keep_alive": -1, "options": {"num_predict": 600}}
 
