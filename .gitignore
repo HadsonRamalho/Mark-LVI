@@ -23,6 +23,9 @@ config/whatsapp_web/
 # ── Personal data the assistant accumulates about you ─────────────────────────
 memory/long_term.json
 memory/*.db
+# reports Claude wrote for you, the log of what was heard vs. what was relayed,
+# and the folder the `claude` command runs in
+memory/claude/
 
 # ── Python build noise ────────────────────────────────────────────────────────
 __pycache__/

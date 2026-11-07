@@ -627,3 +627,68 @@ def save_providers(mode: str = None, pipeline: dict = None, creds: dict = None,
 
     data["providers"] = block
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
+# ── Claude (the `claude` command-line tool) ──────────────────────────────────
+# The assistant can hand the work that is not trivial to the `claude` CLI, which
+# the owner is already logged into. Nothing here is a key: the CLI keeps its own
+# login, and this app neither reads nor stores it.
+#
+# Stored with the other provider settings, under providers.creds.llm_claude, so
+# the panel's provider form and the CONTROLS drawer read and write one place.
+# Off by default: an install that never turns it on behaves exactly as before.
+CLAUDE_PROVIDER_ID = "llm_claude"
+CLAUDE_TIMEOUT_DEFAULT = 300       # seconds one task may run
+CLAUDE_TURNS_DEFAULT = 6           # recent spoken lines handed over with a request
+CLAUDE_PERMISSION_MODES = ("default", "acceptEdits", "plan")
+
+
+def _truthy(value) -> bool:
+    return value is True or str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _bounded_int(value, default: int, lo: int, hi: int) -> int:
+    """A number out of a settings field. "" and 0 both mean "not set" because
+    the panel writes 0 into a numeric box nobody filled in."""
+    try:
+        n = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return default if n <= 0 else max(lo, min(hi, n))
+
+
+def claude_settings_from(cfg: dict) -> dict:
+    """Stored settings -> the values the integration uses, every key present and
+    in range, so callers never guard. Shared by the provider and the CONTROLS
+    drawer so the two can never read the same box differently."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    mode = str(cfg.get("permission_mode") or "").strip()
+    turns = cfg.get("turns")
+    try:
+        turns = max(0, min(40, int(str(turns).strip())))
+    except (TypeError, ValueError):
+        turns = CLAUDE_TURNS_DEFAULT
+    return {
+        "enabled": _truthy(cfg.get("enabled", False)),
+        "timeout": _bounded_int(cfg.get("timeout"), CLAUDE_TIMEOUT_DEFAULT, 10, 3600),
+        # 0 is a real answer here: no earlier conversation, only the request.
+        "turns": turns,
+        "model": str(cfg.get("model") or "").strip(),
+        # Read-only unless the owner says otherwise: a misheard sentence must not
+        # be able to edit files.
+        "permission_mode": mode if mode in CLAUDE_PERMISSION_MODES else "default",
+        "workdir": str(cfg.get("workdir") or "").strip(),
+    }
+
+
+def get_claude_settings() -> dict:
+    return claude_settings_from(get_provider_config(CLAUDE_PROVIDER_ID))
+
+
+def save_claude_settings(**values) -> None:
+    """Merge settings for the Claude integration; only the given keys change."""
+    save_provider_config(CLAUDE_PROVIDER_ID, values)
+
+
+def get_claude_enabled() -> bool:
+    return get_claude_settings()["enabled"]
