@@ -5784,6 +5784,18 @@ class MainWindow(QMainWindow):
         self._hud_btn.clicked.connect(self._toggle_hud_style)
         self._refresh_hud_btn()
 
+        # Claude (the `claude` command). Clicks arrive on the Qt thread and only
+        # read or write the config, so no signal is needed here; the tool the
+        # switch controls is declared to the model at connect time, which is why
+        # the switch asks main.py to rebuild the session.
+        self._claude_btn = _row(QPushButton())
+        self._claude_btn.clicked.connect(self._toggle_claude)
+        self._claude_time_btn = _row(QPushButton())
+        self._claude_time_btn.clicked.connect(self._cycle_claude_timeout)
+        self._claude_turns_btn = _row(QPushButton())
+        self._claude_turns_btn.clicked.connect(self._cycle_claude_turns)
+        self._refresh_claude_btns()
+
         w.adjustSize()
         return w
 
@@ -6628,6 +6640,65 @@ class MainWindow(QMainWindow):
         new_val = not get_brief_enabled()
         save_brief_enabled(new_val)
         self._update_brief_btn(new_val)
+
+    # ── Claude settings ──────────────────────────────────────────────────────
+    _CLAUDE_TIMEOUTS = (60, 120, 300, 600, 1200, 1800)     # seconds
+    _CLAUDE_TURNS = (0, 2, 4, 6, 10, 20)                    # earlier spoken lines
+
+    def _refresh_claude_btns(self):
+        if not hasattr(self, "_claude_btn"):
+            return
+        from memory.config_manager import get_claude_settings
+        s = get_claude_settings()
+        on = s["enabled"]
+        self._claude_btn.setText("◆  CLAUDE: ON" if on else "◆  CLAUDE: OFF")
+        self._claude_btn.setToolTip(
+            "Hands non-trivial requests to the `claude` command you are logged "
+            "into. Needs `claude` on the PATH. Billed to your Claude plan.")
+        self._claude_btn.setStyleSheet(self._BTN_PRI if on else self._BTN_DIM)
+        mins = s["timeout"] / 60
+        self._claude_time_btn.setText(
+            f"⏱  CLAUDE TIME: {mins:g} MIN" if mins >= 1
+            else f"⏱  CLAUDE TIME: {s['timeout']} S")
+        self._claude_time_btn.setToolTip("How long one Claude task may run. Click to change.")
+        self._claude_time_btn.setStyleSheet(self._BTN_DIM)
+        self._claude_turns_btn.setText(f"☰  CLAUDE LINES: {s['turns']}")
+        self._claude_turns_btn.setToolTip(
+            "How many earlier spoken lines are sent with each request. Click to change.")
+        self._claude_turns_btn.setStyleSheet(self._BTN_DIM)
+        for b in (self._claude_time_btn, self._claude_turns_btn):
+            b.setEnabled(on)
+
+    def _toggle_claude(self):
+        from memory.config_manager import get_claude_settings, save_claude_settings
+        on = not get_claude_settings()["enabled"]
+        save_claude_settings(enabled=on)
+        self._refresh_claude_btns()
+        self._log.append_log(
+            "SYS: Claude is on — reconnecting so it can be used." if on
+            else "SYS: Claude is off — reconnecting.")
+        # The tool is declared at connect time, so the session is rebuilt; the
+        # conversation is kept, as it is for an audio-device change.
+        if self.on_audio_device_change:
+            self.on_audio_device_change()
+
+    @staticmethod
+    def _next_in(values: tuple, current: int) -> int:
+        bigger = [v for v in values if v > current]
+        return bigger[0] if bigger else values[0]
+
+    def _cycle_claude_timeout(self):
+        from memory.config_manager import get_claude_settings, save_claude_settings
+        cur = get_claude_settings()["timeout"]
+        save_claude_settings(timeout=self._next_in(self._CLAUDE_TIMEOUTS, cur))
+        self._refresh_claude_btns()
+
+    def _cycle_claude_turns(self):
+        from memory.config_manager import get_claude_settings, save_claude_settings
+        cur = get_claude_settings()["turns"]
+        # Stored as 0 means "none", and 0 must survive being read back.
+        save_claude_settings(turns=self._next_in(self._CLAUDE_TURNS, cur))
+        self._refresh_claude_btns()
 
     # ── Wake word settings ───────────────────────────────────────────────────
 
