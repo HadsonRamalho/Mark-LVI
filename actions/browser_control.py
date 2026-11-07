@@ -13,7 +13,7 @@ import webbrowser
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
-from core import appidentity, outcome
+from core import appidentity, hyprland, outcome
 
 # Importing playwright cost 198 ms at every launch, paid by action discovery
 # whether or not a browser was ever opened. It is the second-largest import in
@@ -1067,6 +1067,60 @@ class _SessionRegistry:
 
 _registry = _SessionRegistry()
 
+# Window classes Hyprland reports for each browser. A name that is not here is
+# searched for as itself, so a browser nobody listed still closes.
+_HYPRLAND_CLASSES: dict[str, list[str]] = {
+    "chrome":  ["chrome", "chromium"],
+    "edge":    ["microsoft-edge"],
+    "firefox": ["firefox"],
+    "opera":   ["opera"],
+    "operagx": ["opera"],
+    "brave":   ["brave"],
+    "vivaldi": ["vivaldi"],
+}
+
+
+def _close_browser_hyprland(requested: str | None) -> str:
+    """Close a browser for real on Hyprland.
+
+    `_registry.close_one` only ends an automation session, and used to answer
+    "closed" while the user's own Firefox stayed open. Here the session is
+    closed first if there is one, then the browser's remaining windows are
+    asked to close through Hyprland — the polite request, never a kill — and
+    the answer says what was observed to go away. The assistant's own windows
+    are never candidates.
+    """
+    name = _ALIASES.get((requested or "").lower().strip(), (requested or "").lower().strip())
+    name = name or _detect_default_browser()
+    session = _registry.close_one(name) if _registry.has(name) else ""
+
+    try:
+        windows = hyprland.windows_of_classes(
+            _HYPRLAND_CLASSES.get(name, [name]), hyprland.list_windows())
+        closed, still_open = hyprland.close_windows(windows) if windows else ([], [])
+    except hyprland.HyprlandError as e:
+        return outcome.failed(
+            "close_browser", e.cause + (f" - {e.fix}" if e.fix else ""),
+            browser=name, session_closed=bool(session))
+
+    if not windows:
+        if session:
+            return outcome.done("close_browser", browser=name,
+                                session_closed=True, windows=0, verified=True)
+        return outcome.failed(
+            "close_browser",
+            f"no {name} window is open and no automation session exists for it",
+            browser=name)
+    if not still_open:
+        return outcome.done("close_browser", browser=name, windows=len(closed),
+                            session_closed=bool(session), verified=True)
+    return outcome.unverified(
+        "close_browser",
+        f"{len(closed)} of {len(windows)} {name} windows closed; the rest are "
+        f"still open - the browser may be asking whether to close its tabs",
+        browser=name, session_closed=bool(session))
+
+
 def browser_control(
     parameters:    dict = None,
     response=None,
@@ -1096,6 +1150,10 @@ def browser_control(
 
     if action == "close":
         target = browser or _registry._active_browser
+        if hyprland.active():
+            result = _close_browser_hyprland(target)
+            _log(player, result)
+            return result
         result = _registry.close_one(target) if target else "No browser specified."
         _log(player, result)
         return result
