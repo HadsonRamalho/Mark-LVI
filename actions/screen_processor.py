@@ -15,6 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
+from core import hyprland
 from core.lazyimport import LazyModule, installed
 
 # OpenCV is 224 ms and is only ever touched by the webcam path — see
@@ -90,6 +91,12 @@ def _compress(img_bytes: bytes, source_format: str = "PNG") -> tuple[bytes, str]
 
 
 def _capture_screen() -> tuple[bytes, str]:
+
+    # `mss` cannot read a Wayland screen; on Hyprland `grim` can. A failure
+    # there is raised with its cause rather than falling back to `mss`, which
+    # would hand the model a blank frame as if it were the screen.
+    if hyprland.active():
+        return _compress(hyprland.capture_png(), "PNG")
 
     if not _MSS:
         raise RuntimeError("mss is not installed. Run: pip install mss")

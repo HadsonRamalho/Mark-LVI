@@ -9,7 +9,7 @@ import platform
 from pathlib import Path
 from datetime import datetime
 
-from core import outcome
+from core import hyprland, outcome
 
 # pyautogui is gone from this file along with the generated-code sandbox that
 # was the only thing using it — see the note below. Nothing here drives the
@@ -105,6 +105,29 @@ def _unknown(said: str) -> str:
     )
 
 
+def _apply_wallpaper_hyprland(path: Path) -> str:
+    """Hyprland draws no wallpaper itself; `hyprpaper` does, over `hyprctl`.
+
+    Without it the old fallback ran `feh`, an X11 tool that does nothing here,
+    and then suggested installing `feh`.
+    """
+    if not shutil.which("hyprpaper"):
+        return ("Could not set wallpaper: Hyprland needs the `hyprpaper` program "
+                "for that and it is not installed - install `hyprpaper` and "
+                "start it with the session")
+    try:
+        result = subprocess.run(
+            ["hyprctl", "hyprpaper", "wallpaper", f",{path}"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=8)
+    except Exception as e:
+        return f"Could not set wallpaper: {e}"
+    answer = (result.stdout or result.stderr).strip()
+    if result.returncode != 0 or answer.lower() != "ok":
+        return f"Could not set wallpaper: hyprpaper answered '{answer[:120]}'"
+    return f"Wallpaper set: {path.name}"
+
+
 def _apply_wallpaper(image_path: str) -> str:
     path = Path(image_path).expanduser().resolve()
     if not path.exists():
@@ -133,6 +156,9 @@ def _apply_wallpaper(image_path: str) -> str:
             )
             subprocess.run(["osascript", "-e", script], capture_output=True)
             return f"Wallpaper set: {path.name}"
+
+        elif hyprland.active():
+            return _apply_wallpaper_hyprland(path)
 
         else:
             desktop_env = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
