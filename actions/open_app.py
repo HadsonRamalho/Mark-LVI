@@ -145,6 +145,7 @@ def _launch_macos(app_name: str) -> bool:
             subprocess.Popen(
                 [binary], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
+            _remember_launch(binary)
             return True
         except Exception:
             pass
@@ -169,6 +170,7 @@ def _launch_linux(app_name: str) -> bool:
                 subprocess.Popen(
                     [path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
                 )
+                _remember_launch(path)
                 return True
             except Exception:
                 continue
@@ -198,6 +200,7 @@ def _launch_linux(app_name: str) -> bool:
                 ["gtk-launch", name], capture_output=True, timeout=5
             )
             if result.returncode == 0:
+                _remember_launch(name)
                 return True
         except FileNotFoundError:
             break
@@ -214,6 +217,22 @@ def _launch_linux(app_name: str) -> bool:
         pass
 
     return _desktop_search(app_name)
+
+
+# What the Linux launcher actually started, for the thread that called it.
+# "terminal" starts `kitty`; verification has to look for kitty, not for the
+# word "terminal".
+_launched = threading.local()
+
+
+def _remember_launch(path: str) -> None:
+    names = getattr(_launched, "names", None)
+    if names is None:
+        names = _launched.names = []
+    for candidate in (path, os.path.realpath(path)):
+        base = os.path.basename(candidate or "")
+        if base and base not in names:
+            names.append(base)
 
 
 _LAUNCHERS = {
@@ -246,7 +265,8 @@ def _say(player, instruction: str) -> None:
 #  Launch + verify, off the conversation's thread
 # ─────────────────────────────────────────────────────────────────────────────
 def _launch_and_verify(player, spoken: str, launcher_name: str,
-                       before: set[int]) -> None:
+                       before: set[int],
+                       windows_before: set[str] | None = None) -> None:
     """The part that takes seconds. Speaks ONLY when something needs saying.
 
     Silence means it worked: the window is on the user's screen and a second
@@ -255,12 +275,16 @@ def _launch_and_verify(player, spoken: str, launcher_name: str,
     """
     try:
         launcher = _LAUNCHERS[_SYSTEM]
+        _launched.names = []
         requested = launcher(launcher_name)
         if not requested and launcher_name.lower() != spoken.lower():
             requested = launcher(spoken)
 
+        extra = tuple(dict.fromkeys(
+            [launcher_name, *getattr(_launched, "names", [])]))
         appeared = appidentity.wait_for_launch(
-            spoken, before, timeout=_LAUNCH_TIMEOUT
+            spoken, before, timeout=_LAUNCH_TIMEOUT,
+            extra_names=extra, windows_before=windows_before,
         )
         if appeared is not None:
             _log(player, f"JARVIS: {appeared.label} is open.")
@@ -270,7 +294,7 @@ def _launch_and_verify(player, spoken: str, launcher_name: str,
             trouble = (f"{spoken} could not be started - nothing on this system "
                        f"answers to that name, so it may not be installed")
         else:
-            trouble = (f"{spoken} was asked to start but no new application "
+            trouble = (f"{spoken} was asked to start but no new window or application "
                        f"appeared within {int(_LAUNCH_TIMEOUT)} seconds, so it "
                        f"is NOT confirmed open - it may be slow to load, or not "
                        f"installed under that name")
@@ -353,11 +377,12 @@ def open_app(parameters=None, response=None, player=None,
 
     launcher_name = appidentity.launcher_name(spoken)
     before = appidentity.snapshot()
+    windows_before = appidentity.window_snapshot()
     _log(player, f"JARVIS: Opening {spoken}…")
 
     threading.Thread(
         target=_launch_and_verify,
-        args=(player, spoken, launcher_name, before),
+        args=(player, spoken, launcher_name, before, windows_before),
         daemon=True, name=f"open-app-{spoken[:20]}",
     ).start()
 

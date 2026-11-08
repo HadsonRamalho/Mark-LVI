@@ -490,6 +490,18 @@ def _score(query: str, process_name: str, titles: list[str]) -> int:
     return 0
 
 
+_COMM_MAX = 15       # Linux truncates a process's `comm` to this many characters
+
+
+def _exe_basename(info: dict) -> str:
+    """The executable's basename, from `exe` or else `cmdline[0]`; '' if neither."""
+    exe = info.get("exe")
+    if not exe:
+        cmd = info.get("cmdline") or []
+        exe = cmd[0] if cmd else ""
+    return os.path.basename(exe) if exe else ""
+
+
 def running(spoken: str, include_self: bool = False) -> list[Match]:
     """Everything running that answers to `spoken`, best match first.
 
@@ -513,7 +525,7 @@ def running(spoken: str, include_self: bool = False) -> list[Match]:
     out: list[Match] = []
 
     try:
-        procs = list(psutil.process_iter(["pid", "name", "exe"]))
+        procs = list(psutil.process_iter(["pid", "name", "exe", "cmdline"]))
     except Exception as exc:
         print(f"[appidentity] process list unavailable: {exc}")
         return []
@@ -525,9 +537,17 @@ def running(spoken: str, include_self: bool = False) -> list[Match]:
             if not pid or not name:
                 continue
             titles = titles_by_pid.get(pid, [])
-            best = max((_score(q, name, titles) for q in queries), default=0)
+            # On Linux `name` is the kernel's `comm`, cut at 15 characters, so
+            # "discord-canary-electron" arrives as "discord-canary-". The
+            # executable's own basename is not cut, and is scored as well.
+            exe_name = _exe_basename(proc.info)
+            names = [name] + ([exe_name] if exe_name and exe_name != name else [])
+            best = max((_score(q, n, titles) for q in queries for n in names),
+                       default=0)
             if best <= 0:
                 continue
+            if exe_name and len(name) >= _COMM_MAX and exe_name.startswith(name):
+                name = exe_name
             if titles:
                 best += _HAS_WINDOW
             # SELF-DETECTION MUST NOT DEPEND ON A READ THAT CAN FAIL.
@@ -585,9 +605,72 @@ def snapshot() -> set[int]:
         return set()
 
 
+def window_snapshot() -> Optional[set[str]]:
+    """Addresses of every window Hyprland shows right now, or None.
+
+    None means "windows cannot be observed here" — not Hyprland, or `hyprctl`
+    failed — and the caller verifies by process only. A failure is logged, not
+    swallowed.
+    """
+    if _OS != "Linux":
+        return None
+    try:
+        from core import hyprland as hl
+        if not hl.active():
+            return None
+        return {w.address for w in hl.list_windows(timeout=_HYPRCTL_TIMEOUT)}
+    except Exception as exc:
+        print(f"[appidentity] hyprctl unavailable, verifying by process: {exc}")
+        return None
+
+
+_HYPRCTL_TIMEOUT = 3.0
+_MIN_WINDOW_NAME = 4        # same floor as _MIN_PARTIAL: short words prove nothing
+
+
+def _window_answers_to(queries: list[str], window, exe_name: str) -> bool:
+    """Does this window's class, initial class, title or executable answer to
+    any of the folded `queries`?"""
+    for cand in (window.cls, window.initial_cls, window.title, exe_name):
+        c = fold(cand)
+        if not c:
+            continue
+        for q in queries:
+            if c == q:
+                return True
+            if len(q) >= _MIN_WINDOW_NAME and q in c:
+                return True
+            if len(c) >= _MIN_WINDOW_NAME and c in q and cand is not window.title:
+                return True
+    return False
+
+
+def _new_window_match(queries: list[str], seen: set[str]) -> Optional[Match]:
+    """A window absent from `seen` that answers to `queries`. Raises on a
+    hyprctl failure so the caller can fall back to processes."""
+    from core import hyprland as hl
+    mine = hl.own_pids()
+    for w in hl.list_windows(timeout=_HYPRCTL_TIMEOUT):
+        if w.address in seen or w.pid in mine:
+            continue
+        exe_name = ""
+        if _PSUTIL and w.pid:
+            try:
+                p = psutil.Process(w.pid)
+                exe_name = _exe_basename({"exe": p.exe(), "cmdline": p.cmdline()})
+            except Exception:
+                pass
+        if _window_answers_to(queries, w, exe_name):
+            return Match(pid=w.pid, name=w.cls or w.initial_cls or exe_name or w.title,
+                         score=_EXACT, is_self=False, titles=[w.title])
+    return None
+
+
 def wait_for_launch(spoken: str, before: set[int],
-                    timeout: float = 12.0, poll: float = 0.25) -> Optional[Match]:
-    """Wait for a NEW process answering to `spoken`, and return it.
+                    timeout: float = 12.0, poll: float = 0.25,
+                    extra_names: tuple[str, ...] = (),
+                    windows_before: Optional[set[str]] = None) -> Optional[Match]:
+    """Wait for something NEW answering to `spoken`, and return it.
 
     This is what turns "the launcher returned" into "the application exists" —
     the whole reason `open_app` used to lie. It polls rather than sleeping a
@@ -598,12 +681,38 @@ def wait_for_launch(spoken: str, before: set[int],
     `before` is a pid snapshot taken BEFORE launching, so an already-running
     copy is not mistaken for the one we just started. The caller checks for
     that case first and says something different about it.
+
+    Two kinds of evidence count, whichever shows first:
+      * a new process whose name or executable answers to `spoken`, to the OS
+        launcher name for it, or to any of `extra_names` (what the launcher
+        actually started: "terminal" starts `kitty`);
+      * on Hyprland (`windows_before` is not None), a new window whose class,
+        initial class, title or executable answers to the same names. This is
+        what catches Firefox or Discord opening a window in a process that
+        already existed, which no pid snapshot can see.
     """
+    names = [spoken, *extra_names]
+    queries: list[str] = []
+    for n in names:
+        for q in spelling_variants(n):
+            if q not in queries:
+                queries.append(q)
+
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        for match in running(spoken):
-            if match.pid not in before:
-                return match
+        if windows_before is not None:
+            try:
+                found = _new_window_match(queries, windows_before)
+                if found is not None:
+                    return found
+            except Exception as exc:
+                print(f"[appidentity] hyprctl failed while waiting, "
+                      f"falling back to processes: {exc}")
+                windows_before = None
+        for n in names:
+            for match in running(n):
+                if match.pid not in before:
+                    return match
         time.sleep(poll)
     return None
 
@@ -852,6 +961,20 @@ def focus(match: "Match") -> bool:
             return r.returncode == 0
         except Exception:
             return False
+
+    # Hyprland first: it is Wayland, so the X11 tools below cannot see its
+    # windows. A failure is logged and the old path still runs.
+    try:
+        from core import hyprland as hl
+        if hl.active():
+            try:
+                hl.focus_pid(match.pid)
+                return True
+            except hl.HyprlandError as exc:
+                print(f"[appidentity] hyprctl could not focus pid "
+                      f"{match.pid}: {exc}")
+    except Exception as exc:
+        print(f"[appidentity] hyprland focus unavailable: {exc}")
 
     # Linux. There is no single API here — X11 window management is whatever
     # the user installed — so the two tools nearly every desktop ships are
