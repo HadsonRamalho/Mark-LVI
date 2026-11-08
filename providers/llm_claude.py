@@ -481,7 +481,7 @@ PROVIDER = {
         Field("permission_mode", "Permissions", kind="choice",
               choices=CLAUDE_PERMISSION_MODES, default="default",
               required=False,
-              hint="default = read only. acceptEdits lets it change files"),
+              hint="default = read only. acceptEdits lets it change files. auto decides each action by itself"),
         Field("workdir", "Work folder", kind="path", required=False,
               advanced=True,
               hint="Where Claude runs. Empty = a private folder in this app's memory"),

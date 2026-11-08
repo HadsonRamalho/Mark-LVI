@@ -1218,6 +1218,12 @@ def test_claude_command_and_stream():
                       "--verbose", "--permission-mode"], str(cmd))
     check("permission mode and model are passed",
           "acceptEdits" in cmd and cmd[cmd.index("--model") + 1] == "opus")
+    from memory.config_manager import claude_settings_from
+    check("auto is a permission mode the settings keep",
+          claude_settings_from({"permission_mode": "auto"})["permission_mode"] == "auto")
+    auto = lc.ClaudeCLI({"permission_mode": "auto"}).build_command("/x/claude")
+    check("auto reaches the command line",
+          auto[auto.index("--permission-mode") + 1] == "auto")
     check("the system text is appended, not replacing the default",
           cmd[cmd.index("--append-system-prompt") + 1] == "SYS")
     check("a session is resumed by id", cmd[cmd.index("--resume") + 1] == "abc")

@@ -640,7 +640,7 @@ def save_providers(mode: str = None, pipeline: dict = None, creds: dict = None,
 CLAUDE_PROVIDER_ID = "llm_claude"
 CLAUDE_TIMEOUT_DEFAULT = 300       # seconds one task may run
 CLAUDE_TURNS_DEFAULT = 6           # recent spoken lines handed over with a request
-CLAUDE_PERMISSION_MODES = ("default", "acceptEdits", "plan")
+CLAUDE_PERMISSION_MODES = ("default", "acceptEdits", "auto", "plan")
 
 
 def _truthy(value) -> bool:
