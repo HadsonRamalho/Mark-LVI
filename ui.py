@@ -127,6 +127,20 @@ _PALETTE_DEFAULTS: dict[str, str] = {k: getattr(C, k) for k in _HUE_LINKED}
 
 DEFAULT_UI_COLOR = _PALETTE_DEFAULTS["PRI"]
 
+# Accents that come with a whole palette instead of a hue shift. The Hades pink
+# keeps the surfaces and text near-neutral (the Hades panel's dark tokens) and
+# leaves the pink for highlights only; a hue shift would turn everything magenta.
+HADES_UI_COLOR = "#ffc6df"
+_ACCENT_PALETTES: dict[str, dict[str, str]] = {
+    HADES_UI_COLOR: {
+        "BG": "#12090e", "PANEL": "#1c1117", "PANEL2": "#201319",
+        "BORDER": "#33232c", "BORDER_B": "#6e5562", "BORDER_A": "#4a3540",
+        "PRI": "#ffc6df", "PRI_DIM": "#b98aa0", "PRI_GHO": "#2a1a22",
+        "TEXT": "#f2e6d9", "TEXT_DIM": "#8c7a85", "TEXT_MED": "#b29eab",
+        "WHITE": "#fbf3ea", "DARK": "#0d0609", "BAR_BG": "#1a0f15",
+    },
+}
+
 
 def apply_ui_accent(accent_hex: str) -> bool:
     """
@@ -144,6 +158,12 @@ def apply_ui_accent(accent_hex: str) -> bool:
         int(accent_hex[1:], 16)
     except ValueError:
         return False
+
+    preset = _ACCENT_PALETTES.get(accent_hex)
+    if preset is not None:
+        for key in _HUE_LINKED:
+            setattr(C, key, preset.get(key, _PALETTE_DEFAULTS[key]))
+        return True
 
     def _hsv(h: str) -> tuple[float, float, float]:
         r = int(h[1:3], 16) / 255
