@@ -1121,6 +1121,11 @@ elif mode == "empty":
     result("")
 elif mode == "plain":
     result("Just an answer with no tags.")
+elif mode == "spoken":
+    result("## Resumo\n\nO serviço está no ar e responde bem, com cerca de quarenta "
+           "por cento a menos de espera do que na semana passada.\n\n## O que falta"
+           "\n\nFalta decidir se o limite de memória sobe para dois gigabytes. "
+           "Ninguém mexeu nisso ainda, e o painel continua sem o gráfico novo.")
 else:
     emit({{"type": "assistant", "message": {{"content": [
         {{"type": "tool_use", "name": "Read", "input": {{}}}}]}}}})
