@@ -14,8 +14,12 @@ WHY THIS EXISTS
     second text-to-speech: the Live model is the voice.
 
 THE PIECES
-    source_text(path)   what to read for a report. Its own function on purpose:
-                        a spoken version written by Claude replaces it later.
+    source_text(path)   what to read for a report: the version Claude wrote for
+                        listening when a current one is saved beside it, else
+                        the report as written. Its own function on purpose.
+    spoken_*            the version for listening: made by Claude only when a
+                        reading is asked for, saved as `<name>.spoken.md`, valid
+                        while newer than the report, never counted as a report.
     to_speakable(md)    Markdown -> [(section title, spoken text)]. Pure.
     build_blocks(...)   sections -> blocks of about BLOCK_LIMIT characters.
     read_report(...)    the tool: start / next / previous / goto / repeat /
@@ -23,11 +27,23 @@ THE PIECES
 
 The reports folder is `claude_task._data_dir() / "reports"`; tests point
 `reports_dir` somewhere else.
+
+WHY THE SPOKEN VERSION IS MADE ON REQUEST
+    A report written to be read (tables, exact numbers, long lists) sounds bad
+    aloud even once the Markdown is cleaned. Asking Claude for a second version
+    on every `claude_task` would spend tokens on reports nobody asks to hear, so
+    it is made here, the first time a reading is asked for, and then reused.
+    It takes tens of seconds, so `start` returns at once with a note for the
+    voice model and the first block is handed over through `speak` when ready,
+    the way `claude_task` hands over its result. If Claude cannot do it, the
+    literal report is read and the reason is said: never silence.
 """
 from __future__ import annotations
 
+import os
 import re
 import threading
+import time
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -35,6 +51,9 @@ from pathlib import Path
 from typing import Optional
 
 BLOCK_LIMIT = 900      # characters; a block is cut by paragraph past this
+SPOKEN_SUFFIX = ".spoken.md"   # same value as claude_task.SPOKEN_SUFFIX
+SPOKEN_TIMEOUT = 150           # seconds Claude gets to write the spoken version
+SPOKEN_MIN_WORDS = 25          # fewer than this is not a spoken version
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Finding the reports
@@ -91,7 +110,8 @@ def list_reports() -> list[Report]:
     """Every report, newest first."""
     out: list[Report] = []
     try:
-        files = list(reports_dir().glob("*.md"))
+        files = [p for p in reports_dir().glob("*.md")
+                 if not p.name.endswith(SPOKEN_SUFFIX)]
     except OSError:
         return []
     for p in files:
@@ -177,13 +197,128 @@ def choose_report(query: str = "", day: str = "", which: str = ""
 # ─────────────────────────────────────────────────────────────────────────────
 #  Markdown -> text that can be spoken
 # ─────────────────────────────────────────────────────────────────────────────
-def source_text(path: Path) -> str:
+def spoken_path(path: Path) -> Path:
+    """Where the version for listening of `path` is kept: beside it."""
+    path = Path(path)
+    return path.with_name(path.stem + SPOKEN_SUFFIX)
+
+
+def spoken_is_current(path: Path) -> bool:
+    """True when a spoken version exists and is not older than the report."""
+    try:
+        sp = spoken_path(path)
+        return (sp.stat().st_size > 0
+                and sp.stat().st_mtime_ns >= Path(path).stat().st_mtime_ns)
+    except OSError:
+        return False
+
+
+def source_text(path: Path, mode: str = "spoken") -> str:
     """The text a report is read from.
 
-    Today that is the report file itself, as written. This is the one place to
-    change when a spoken version of each report exists: take the same path,
-    return the other text, and nothing else here needs to know."""
+    mode "literal": the report file as written. mode "spoken" (the default):
+    the version made for listening when a current one is saved beside the
+    report, otherwise the report as written. It never calls Claude: that is slow
+    and is done by `_prepare`, which saves the file this then finds."""
+    if mode != "literal" and spoken_is_current(path):
+        try:
+            text = spoken_path(path).read_text(encoding="utf-8", errors="replace")
+            if text.strip():
+                return text
+        except OSError:
+            pass
     return Path(path).read_text(encoding="utf-8", errors="replace")
+
+
+_SPOKEN_SYSTEM = """\
+You rewrite a written report so that it can be listened to. A voice assistant
+will read your text aloud, word for word, to the person who asked for the report.
+Reply with the rewritten text only: no preface, no comment on what you did, no
+code fence around it.
+
+How it must read:
+- Length: between 200 and 450 words, about one to three minutes aloud. A short
+  report may be shorter; never pad.
+- Language: the language the report is written in.
+- Plain sentences, as a person would say them. No table (turn each row into a
+  sentence or fold the rows into a sentence that compares them), no bullet
+  lists, no code, no file paths, no URLs, no commands, no emoji.
+- Numbers: round them when the exact value does not matter ("about forty
+  percent", "a little over two hours"); keep them exact when it does (versions,
+  dates, error codes, amounts, counts that are the point).
+- Divide the text into sections. Start each with a heading line `## ` followed
+  by a short title of two to five words. Do not write a title for the whole
+  report and do not use any other heading level.
+- Put the conclusion or the answer first, then the support, then what is left
+  to do or decide, each in its own section.
+
+What must not change:
+- No fact, name, number or condition that changes the meaning may be altered,
+  dropped or invented. Keep every warning, failure, open question and caveat.
+- If the report says it could not do or check something, say so.
+- Do not add advice, opinion or anything that is not in the report."""
+
+
+def spoken_prompt(report: str) -> tuple[str, str]:
+    """(system, prompt) asking Claude for the version for listening."""
+    return _SPOKEN_SYSTEM, ("Rewrite this report for listening.\n\n"
+                            "REPORT:\n\n" + report.strip())
+
+
+def _clean_spoken(text: str) -> str:
+    """The model's answer without a code fence round it, or "" if it is not a
+    usable spoken version."""
+    text = (text or "").strip()
+    m = re.fullmatch(r"```[A-Za-z]*\n(.*?)\n?```", text, re.S)
+    if m:
+        text = m.group(1).strip()
+    return text if len(text.split()) >= SPOKEN_MIN_WORDS else ""
+
+
+def make_spoken(path: Path, *, cancel: Optional[threading.Event] = None,
+                client=None) -> tuple[str, str, Optional[float]]:
+    """Ask Claude for the version for listening of the report at `path`, save it
+    beside the report and return (text, "", cost) - or ("", why, None), where
+    `why` is a sentence naming the cause (the provider's own failure message).
+    Plain call: no tools, no saved session. Never raises. Slow: run it off the
+    voice thread."""
+    from actions import claude_task as ct
+    from providers.llm_claude import ClaudeError
+    try:
+        report = Path(path).read_text(encoding="utf-8", errors="replace")
+        if not report.strip():
+            return "", "The report is empty.", None
+        system, prompt = spoken_prompt(report)
+        t0 = time.monotonic()
+        res = (client or ct._client()).run(
+            prompt, system=system, replace_system=True, plain=True,
+            timeout=SPOKEN_TIMEOUT, cancel=cancel)
+        text = _clean_spoken(res.text)
+        took = time.monotonic() - t0
+        cost = (f"${res.cost_usd:.4f}" if res.cost_usd is not None
+                else "cost unknown")
+        ct.log_request({"event": "spoken", "report": Path(path).name,
+                        "seconds": round(took, 1), "cost_usd": res.cost_usd,
+                        "words": len(text.split()), "ok": bool(text)})
+        if not text:
+            return "", ("Claude's version for listening came back too short "
+                        "to use."), res.cost_usd
+        try:
+            sp = spoken_path(path)
+            tmp = sp.with_name(sp.name + ".tmp")
+            tmp.write_text(text + "\n", encoding="utf-8")
+            os.replace(tmp, sp)
+        except OSError as e:
+            # The text is good; only the cache is lost. Read it anyway.
+            print(f"[read_report] could not save the spoken version: {e}")
+        print(f"[read_report] spoken version of {Path(path).name}: "
+              f"{len(text.split())} words, {took:.0f}s, {cost}")
+        return text, "", res.cost_usd
+    except (ClaudeError, RuntimeError, LookupError) as e:
+        # RuntimeError/LookupError: the registry refusing to build the provider.
+        return "", str(e), None
+    except Exception as e:
+        return "", f"Writing the version for listening failed: {type(e).__name__}.", None
 
 
 @dataclass
@@ -450,6 +585,7 @@ class _Reading:
     sections: list = field(default_factory=list)
     blocks: list = field(default_factory=list)
     index: int = 0
+    spoken: bool = False      # read from the version made for listening
 
 
 _ACTIONS = ("start", "next", "previous", "goto", "repeat", "stop", "list")
@@ -476,16 +612,74 @@ def _deliver(r: _Reading, prefix: str = "") -> str:
             f"TEXT:\n{b.text}")
 
 
-def _open(path: Path) -> tuple[Optional[_Reading], str]:
+def _open(path: Path, mode: str = "spoken", text: Optional[str] = None
+          ) -> tuple[Optional[_Reading], str]:
+    """Open `path` for reading. `text` is given when it was just made and is not
+    (or not only) on disk; the title is always the report's own."""
     try:
-        text = source_text(path)
+        literal = Path(path).read_text(encoding="utf-8", errors="replace")
+        if text is None:
+            text = source_text(path, mode)
     except OSError as e:
         return None, f"Could not open that report ({type(e).__name__}). Say so in one short sentence."
     sections = to_speakable(text)
     blocks = build_blocks(sections)
     if not blocks:
         return None, "That report has no text to read. Say so in one short sentence."
-    return _Reading(path, _title_of(text, path.stem), sections, blocks), ""
+    return _Reading(path, _title_of(literal, Path(path).stem), sections, blocks,
+                    spoken=text != literal), ""
+
+
+# ── the version for listening is being made ──────────────────────────────────
+_preparing: dict = {}        # {"cancel": Event} while Claude writes it
+
+
+def _start_note(reading: _Reading) -> str:
+    return (f"Starting a report of {len(reading.sections)} section(s)"
+            + (", in the version made for listening. " if reading.spoken else ". "))
+
+
+def _announce_literal(why: str) -> str:
+    """Prefix for a literal reading that was meant to be spoken, with the cause."""
+    return (f"The version made for listening is not available: {why} Say that in "
+            "one short sentence, in the user's language, then read the report as "
+            "written. ")
+
+
+def _prepare(path: Path, speak, player, cancel: threading.Event) -> None:
+    """The slow part, on its own thread: make the version for listening, then
+    hand the first block to the voice. Every way out ends in a sentence."""
+    global _current
+    from actions import claude_task as ct
+    try:
+        ct._write_log(player, f"making the version for listening of {Path(path).name}")
+        text, why, cost = make_spoken(path, cancel=cancel)
+        if cancel.is_set():
+            return
+        with _lock:
+            if _preparing.get("cancel") is not cancel:
+                return
+            reading, err = (_open(path, "spoken", text) if text
+                            else _open(path, "literal"))
+            if reading is None:
+                msg = f"[REPORT_FAILED] {err}"
+            else:
+                _current = reading
+                if text:
+                    msg = ("[REPORT_READY] " + _deliver(reading, _start_note(reading)))
+                else:
+                    ct._write_log(player, f"no version for listening: {why}")
+                    msg = ("[REPORT_READY] " + _deliver(
+                        reading, _announce_literal(why) + _start_note(reading)))
+        ct._announce(speak, msg)
+    except Exception as e:      # the thread must end in a sentence, never silence
+        ct._write_log(player, f"read_report crashed: {type(e).__name__}: {e}")
+        ct._announce(speak, "[REPORT_FAILED] Reading the report failed. Tell the "
+                            "user in one short sentence.")
+    finally:
+        with _lock:
+            if _preparing.get("cancel") is cancel:
+                _preparing.clear()
 
 
 def _section_index(r: _Reading, target: str) -> Optional[int]:
@@ -508,7 +702,18 @@ def _section_index(r: _Reading, target: str) -> Optional[int]:
     return None
 
 
-def read_report(parameters: dict, player=None, session_memory=None) -> str:
+# The tool is told to pass `literal`; these stems are for a Live that passes the
+# user's own words instead ("na íntegra", "exatamente", "word for word").
+_LITERAL_STEMS = ("literal", "exat", "exact", "integra", "inteir", "complet",
+                  "verbatim", "full", "original", "word")
+
+
+def _wants_literal(value: str) -> bool:
+    return any(w.startswith(_LITERAL_STEMS) for w in _norm(value).split())
+
+
+def read_report(parameters: dict, player=None, speak=None,
+                session_memory=None) -> str:
     """Read a report in blocks. Returns at once; never raises."""
     global _current
     try:
@@ -518,19 +723,55 @@ def read_report(parameters: dict, player=None, session_memory=None) -> str:
             return (f"Unknown action '{action}'. Use start, next, previous, goto, "
                     "repeat, stop or list.")
         with _lock:
+            if _preparing and action != "stop":
+                return ("[BUSY] The version for listening is still being made. Say "
+                        "in one short sentence that it is not ready yet.")
             if action == "start":
                 path_report, why = choose_report(str(p.get("query") or ""),
                                                  str(p.get("date") or ""),
                                                  str(p.get("which") or ""))
                 if path_report is None:
                     return why
-                reading, why = _open(path_report.path)
+                path = path_report.path
+                mode = "literal" if _wants_literal(str(p.get("mode") or "")) else "spoken"
+                if mode == "spoken" and not spoken_is_current(path):
+                    from memory.config_manager import get_claude_settings
+                    try:
+                        enabled = bool(get_claude_settings()["enabled"])
+                    except Exception:
+                        enabled = False
+                    why = ""
+                    if not enabled:
+                        why = ("Claude is switched off, and it is what writes that "
+                               "version; it can be switched on under CONTROLS.")
+                    elif speak is None:
+                        why = "there is no way to wait for it here."
+                    if why:
+                        reading, err = _open(path, "literal")
+                        if reading is None:
+                            return err
+                        _current = reading
+                        return _deliver(reading, _announce_literal(why)
+                                        + _start_note(reading))
+                    cancel = threading.Event()
+                    _preparing["cancel"] = cancel
+                    threading.Thread(target=_prepare, daemon=True,
+                                     name="read-report-spoken",
+                                     args=(path, speak, player, cancel)).start()
+                    return ("[STARTED] Claude is writing a version of the report made "
+                            "for listening; it takes up to a minute. Say ONE short "
+                            "sentence, in the user's language, that you are preparing "
+                            "it and will start reading when it is ready. Nothing else.")
+                reading, why = _open(path, mode)
                 if reading is None:
                     return why
                 _current = reading
-                total = len(reading.sections)
-                return _deliver(reading, f"Starting a report of {total} section(s). ")
+                return _deliver(reading, _start_note(reading))
             if action == "stop":
+                if _preparing:
+                    _preparing["cancel"].set()
+                    _preparing.clear()
+                    return "Stopped. Say so in one short sentence."
                 if _current is None:
                     return "No report is being read. Say so in one short sentence."
                 _current = None
@@ -579,7 +820,10 @@ TOOL = {
         "Read a saved Claude report aloud, only when the user asks: say exactly the "
         "text a call returns, no summary, no comment, then ask whether to go on. "
         "action=start picks the report (the latest unless query, date or which says "
-        "otherwise); next, previous, repeat, goto, stop and list move through it."
+        "otherwise); next, previous, repeat, goto, stop and list move through it. "
+        "By default it reads a version Claude writes for listening (the first time "
+        "it takes up to a minute: say the short wait line you are given); "
+        "mode=literal only when the user asks for it word for word."
     ),
     "brief": "Read a saved Claude report aloud, block by block, when asked.",
     "parameters": {
@@ -607,6 +851,13 @@ TOOL = {
             "section": {
                 "type": "STRING",
                 "description": "goto: a section number or part of its title.",
+            },
+            "mode": {
+                "type": "STRING",
+                "description": ("start: 'spoken' (default) reads the version made for "
+                                "listening; 'literal' reads the report as written. Use "
+                                "literal only when the user asks for the whole report, "
+                                "\"in full\", \"literally\" or \"exactly\"."),
             },
         },
     },

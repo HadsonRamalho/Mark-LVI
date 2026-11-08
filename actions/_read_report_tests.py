@@ -3,11 +3,14 @@ Self-test for actions/read_report.py.
 
     python -m actions._read_report_tests
 
-No network, no key, no `claude`. Reports are written into a temporary folder:
-`read_report.reports_dir` is pointed at it, so memory/ is never read or written.
+No network, no key, no real `claude`: the spoken version is made by the fake
+`claude` of providers/_tests.py, with its own config and data folder. Reports are
+written into a temporary folder: `read_report.reports_dir` is pointed at it, so
+memory/ is never read or written.
 """
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 from datetime import date, datetime
@@ -234,7 +237,7 @@ def test_extension_point_and_tool(folder: Path) -> None:
     p = _write(folder, "20261108-010101-fonte.md", "## Um\n\nTexto original.\n")
     check("source_text(path) returns the file's text", "Texto original." in rr.source_text(p))
     original = rr.source_text
-    rr.source_text = lambda path: "## Falado\n\nOutra versão.\n"
+    rr.source_text = lambda path, mode="spoken": "## Falado\n\nOutra versão.\n"
     try:
         res = rr.read_report({})
         check("replacing source_text changes what is read, nothing else",
@@ -252,6 +255,248 @@ def test_extension_point_and_tool(folder: Path) -> None:
         check("its declaration has no required parameters", decl is not None
               and not decl.get("parameters", {}).get("required"))
     _fresh(folder)
+
+
+# ── the version made for listening ───────────────────────────────────────────
+_REPORT = ("# Relatório do serviço\n\n## Estado\n\n| Item | Valor |\n|---|---|\n"
+           "| latência | 412,7 ms |\n| erros | 3 |\n\n## Pendências\n\n"
+           "- decidir o limite de memória\n- ver `config/app.json`\n")
+
+
+def test_spoken(folder: Path) -> None:
+    import os
+    import time
+    from memory.config_manager import save_claude_settings
+    from providers._tests import _FakeClaude, _wait
+    from actions import claude_task as ct
+
+    section("[7] the version made for listening")
+    _fresh(folder)
+    original_timeout = rr.SPOKEN_TIMEOUT
+    with _FakeClaude() as fake:
+        spoken: list[str] = []
+        logs: list[str] = []
+
+        class _Player:
+            def write_log(self, t): logs.append(t)
+
+        def start(**params):
+            return rr.read_report(params, _Player(), spoken.append)
+
+        def idle() -> bool:
+            return _wait(lambda: not rr._preparing)
+
+        report = _write(folder, "20261108-100000-servico.md", _REPORT)
+        sp = rr.spoken_path(report)
+        check("the spoken version is named after the report",
+              sp.name == "20261108-100000-servico.spoken.md" and sp.parent == folder)
+
+        # Claude off: the literal, at once, with the reason. Claude is not called.
+        save_claude_settings(enabled=False)
+        fake.mode("spoken")
+        res = start()
+        check("Claude off: it reads the literal and says why",
+              "TEXT:" in res and "switched off" in res and "412,7 ms" in res
+              and not res.startswith("[STARTED]"), res)
+        check("Claude off: the CLI was not called", fake.calls() == [])
+        rr._current = None
+        save_claude_settings(enabled=True)
+
+        res = rr.read_report({}, None, None)
+        check("no way to wait (no speak): the literal, with the reason, no call",
+              "TEXT:" in res and "no way to wait" in res and fake.calls() == [], res)
+        rr._current = None
+
+        # First reading: made on request, off the voice thread.
+        t0 = time.monotonic()
+        res = start()
+        check("start returns at once with a wait line, not the text",
+              time.monotonic() - t0 < 2 and res.startswith("[STARTED]")
+              and "TEXT:" not in res and "ONE short sentence" in res, res)
+        check("a second start while it is made is turned away",
+              start().startswith("[BUSY]"))
+        check("so is 'next'", rr.read_report({"action": "next"}).startswith("[BUSY]"))
+        check("the first block reaches the voice by itself",
+              _wait(lambda: bool(spoken)))
+        idle()
+        msg = spoken[0] if spoken else ""
+        check("it is the spoken text, whole instruction included",
+              msg.startswith("[REPORT_READY]") and "TEXT:" in msg
+              and "quarenta por cento" in msg and "Read exactly" in msg, msg)
+        check("it says it is the version for listening",
+              "version made for listening" in msg)
+        check("not the literal table", "412,7" not in msg and "Item" not in msg)
+        calls = fake.calls()
+        check("Claude was called once", len(calls) == 1, str(len(calls)))
+        args = calls[0]["args"] if calls else []
+        check("plain call: no tools, no saved session, no resume",
+              "--tools" in args and args[args.index("--tools") + 1] == ""
+              and "--no-session-persistence" in args and "--resume" not in args,
+              str(args))
+        check("it replaces the system text with the rules for listening",
+              "--system-prompt" in args
+              and "200 and 450 words" in args[args.index("--system-prompt") + 1])
+        check("and sent the whole report", "412,7 ms" in calls[0]["stdin"]
+              and "decidir o limite de memória" in calls[0]["stdin"])
+        check("the spoken version is saved beside the report",
+              sp.exists() and "quarenta por cento" in sp.read_text(encoding="utf-8"))
+        check("the reading is on, in sections of the spoken text",
+              rr._current is not None and rr._current.spoken
+              and [x.title for x in rr._current.sections] == ["Resumo", "O que falta"])
+        nxt = rr.read_report({"action": "next"})
+        check("next goes on in the spoken text", "O que falta" in nxt
+              and "gigabytes" in nxt, nxt)
+        check("goto by section title keeps working",
+              "Resumo" in rr.read_report({"action": "goto", "section": "resumo"}))
+        rr._current = None
+
+        lines = [json.loads(x) for x in
+                 (fake.dir / "data" / "requests.jsonl").read_text().splitlines()]
+        done = [x for x in lines if x.get("event") == "spoken"]
+        check("the cost is logged", len(done) == 1 and done[0]["cost_usd"] == 0.0123
+              and done[0]["ok"], str(lines))
+
+        # Cache: reused while it is newer than the report.
+        spoken.clear()
+        res = start()
+        check("a current cache is read at once, no wait, no call",
+              res.startswith("Starting a report") and "quarenta por cento" in res
+              and "version made for listening" in res and len(fake.calls()) == 1, res)
+        rr._current = None
+
+        # Stale: the report changed after the spoken version was written.
+        past = time.time() - 3600
+        os.utime(sp, (past, past))
+        check("a report newer than its spoken version makes it stale",
+              not rr.spoken_is_current(report))
+        res = start()
+        check("stale cache: regenerated (a new wait line)", res.startswith("[STARTED]"), res)
+        check("and a new call was made", _wait(lambda: len(fake.calls()) == 2)
+              and _wait(lambda: bool(spoken)))
+        idle()
+        check("the regenerated version is current again", rr.spoken_is_current(report))
+        rr._current = None
+
+        # Literal: never calls Claude, even with a cache.
+        n = len(fake.calls())
+        for word in ("literal", "na íntegra", "exatamente"):
+            res = start(mode=word)
+            check(f"mode '{word}': the report as written, no call",
+                  res.startswith("Starting a report") and "412,7 ms" in res
+                  and "quarenta" not in res and len(fake.calls()) == n, res)
+            rr._current = None
+        check("mode 'spoken' is the default and means the same as no mode",
+              "quarenta por cento" in start(mode="spoken"))
+        rr._current = None
+
+        # The spoken files are not reports.
+        names = [r.path.name for r in rr.list_reports()]
+        check("the choice of reports ignores .spoken.md", names == [report.name], str(names))
+        check("so does the one before the latest",
+              "no report before" in rr.read_report({"which": "previous"}))
+        later_spoken = time.time() + 600
+        os.utime(sp, (later_spoken, later_spoken))
+        check("even when it is the newest file",
+              rr.choose_report()[0].path == report)
+        check("by name: the fragment finds the report, not its spoken twin",
+              rr.choose_report("servico")[0].path == report)
+
+        panel = fake.dir / "data" / "reports"
+        panel.mkdir(parents=True, exist_ok=True)
+        _write(panel, "20261101-000000-a.md", "# A\n\nTexto.\n")
+        old = _write(panel, "20261101-000000-a.spoken.md", "## A\n\nTexto falado.\n")
+        os.utime(old, (later_spoken, later_spoken))
+        ct._last_report = None
+        last = ct.last_report()
+        ct._last_report = None
+        check("the panel's last report ignores .spoken.md",
+              last is not None and last["path"].endswith("-a.md"), str(last))
+
+        # Failures: the literal is read, and the cause is said.
+        cases = [
+            ("login", "claude auth login"),
+            ("limit", "usage limit"),
+            ("empty", "answered with nothing"),
+            ("plain", "too short"),
+            ("crash", "Claude failed"),
+        ]
+        for mode, expect in cases:
+            sp.unlink(missing_ok=True)
+            spoken.clear()
+            fake.mode(mode)
+            res = start()
+            ok = res.startswith("[STARTED]") and _wait(lambda: bool(spoken))
+            idle()
+            msg = spoken[0] if spoken else res
+            check(f"{mode}: it reads the literal and says why ({expect})",
+                  ok and expect in msg and "412,7 ms" in msg
+                  and "read the report as written" in msg, msg)
+            check(f"{mode}: nothing is cached", not sp.exists())
+            check(f"{mode}: the reading is the literal",
+                  rr._current is not None and not rr._current.spoken)
+            rr._current = None
+
+        sp.unlink(missing_ok=True)
+        spoken.clear()
+        rr.SPOKEN_TIMEOUT = 1
+        fake.mode("sleep")
+        start()
+        ok = _wait(lambda: bool(spoken), 10)
+        idle()
+        check("timeout: it reads the literal and says it did not finish",
+              ok and "did not finish within 1 seconds" in spoken[0]
+              and "412,7 ms" in spoken[0], str(spoken))
+        rr.SPOKEN_TIMEOUT = original_timeout
+        rr._current = None
+
+        # stop while it is being made
+        spoken.clear()
+        fake.mode("sleep")
+        n = len(fake.calls())
+        start()
+        _wait(lambda: len(fake.calls()) > n)
+        check("stop while it is being made", "Stopped" in rr.read_report({"action": "stop"}))
+        time.sleep(1.0)
+        check("and nothing is said afterwards", spoken == [] and rr._current is None
+              and not rr._preparing, str(spoken))
+        check("a new start is accepted after that", not start().startswith("[BUSY]"))
+        rr.read_report({"action": "stop"})
+        time.sleep(0.5)
+
+    # the pieces
+    system, prompt = rr.spoken_prompt("# T\n\nCorpo.")
+    check("the rules: language, length, no table or path or code, no invention",
+          all(w in system for w in ("language the report is written in",
+                                    "200 and 450 words", "No table",
+                                    "no file paths", "No fact, name, number")), system)
+    check("the report is in the prompt", "Corpo." in prompt)
+    check("a fence round the answer is taken off",
+          rr._clean_spoken("```markdown\n" + "palavra " * 30 + "\n```") == ("palavra " * 30).strip())
+    check("a very short answer is not a version", rr._clean_spoken("Pronto.") == "")
+    _fresh(folder)
+    rr.SPOKEN_TIMEOUT = original_timeout
+
+
+def test_spoken_declaration() -> None:
+    section("[8] the declaration and the prompt for the spoken version")
+    mode = rr.TOOL["parameters"]["properties"].get("mode", {})
+    check("the tool has a mode parameter", mode.get("type") == "STRING")
+    check("it says what spoken and literal are",
+          "spoken" in mode["description"] and "literal" in mode["description"]
+          and "in full" in mode["description"])
+    check("the description tells the Live about the wait and the literal",
+          "mode=literal" in rr.TOOL["description"] and "minute" in rr.TOOL["description"])
+    check("the handler takes the session's speak",
+          "speak" in rr.read_report.__code__.co_varnames[:4])
+    prompt = (Path(__file__).resolve().parent.parent / "core" / "prompt.txt").read_text(
+        encoding="utf-8")
+    block = prompt.split("{if:read_report}", 1)[1].split("{/if}", 1)[0]
+    check("the prompt: spoken by default, literal on 'in full' / 'exactly'",
+          "mode=literal" in block and "literally" in block and "exactly" in block)
+    check("the prompt: one sentence of wait, then read what arrives by itself",
+          "[REPORT_READY]" in block and "[STARTED]" in block)
+    check("the prompt: say why when it fell back to the literal",
+          "not available" in block)
 
 
 def test_prompt() -> None:
@@ -284,6 +529,8 @@ def main() -> int:
             test_navigation(folder)
             test_extension_point_and_tool(folder)
             test_prompt()
+            test_spoken(folder)
+            test_spoken_declaration()
         finally:
             rr.reports_dir, rr._today = original_dir, original_today
             rr._current = None

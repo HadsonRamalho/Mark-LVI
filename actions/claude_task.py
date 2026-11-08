@@ -206,6 +206,11 @@ def write_report(heard: str, report: str, when: Optional[datetime] = None) -> Pa
     return path
 
 
+# `read_report` keeps the version written for listening beside the report as
+# `<same name>.spoken.md`. It is a cache, not a report: nothing that lists the
+# reports (the panel's "last report", the reader's choice) may count it.
+SPOKEN_SUFFIX = ".spoken.md"
+
 _last_report: dict | None = None
 _report_listener: Optional[Callable] = None
 
@@ -233,7 +238,8 @@ def last_report() -> Optional[dict]:
     global _last_report
     if _last_report is None:
         try:
-            files = sorted((_data_dir() / "reports").glob("*.md"),
+            files = sorted((p for p in (_data_dir() / "reports").glob("*.md")
+                            if not p.name.endswith(SPOKEN_SUFFIX)),
                            key=lambda p: p.stat().st_mtime)
             if files:
                 p = files[-1]
