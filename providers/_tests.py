@@ -1164,6 +1164,10 @@ class _FakeClaude:
         self._data = llm_claude.DATA_DIR
         llm_claude.DATA_DIR = self.dir / "data"
         registry.reset()
+        # The Hades writing check is on by default when the Hades is installed,
+        # and this machine may have it. These tests are about Claude; the check
+        # has its own (plugins/_hades_tests.py).
+        cm.save_plugin_config("hades", {"write_check": False})
         return self
 
     def mode(self, mode: str) -> None:

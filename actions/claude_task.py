@@ -21,6 +21,14 @@ HOW IT RETURNS
     agent's does. If Claude needs an answer it asks, the question is spoken, and
     the user's answer resumes the SAME Claude session (`answering=true`).
 
+THE HADES WRITING GUIDE
+    When the Hades is installed, its writing rules (reference/escrita.md) are
+    added to Claude's prompt, and the report goes through `hades write-check`
+    before it is saved. A finding earns ONE correction pass by Claude; if the
+    check still finds something, the report is saved with the findings noted at
+    its end. Without the Hades, or with the setting off, nothing changes. The
+    switch is in the Hades plugin's settings.
+
 WHAT IS LOGGED
     One line per request in memory/claude/requests.jsonl: what was heard, what
     the Live model paraphrased, how alike they are, and later what the task cost.
@@ -38,6 +46,8 @@ import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
+
+from core import hades_cli
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  What Claude is told
@@ -60,6 +70,34 @@ Only when you truly cannot go on without something from the owner, send this ins
 
 Do the work with what you have. Decide what you can decide; do not ask the owner to \
 confirm things that are yours to choose. Never put the report inside <speech>."""
+
+
+def _writing_cli() -> Optional[list]:
+    """The Hades CLI when reports should follow its writing guide, else None.
+
+    On by default whenever the CLI exists; the plugin setting turns it off."""
+    try:
+        if not hades_cli.setting("write_check", True):
+            return None
+        return hades_cli.find_cli()
+    except Exception:
+        return None
+
+
+def system_prompt(cli: Optional[list] = None) -> str:
+    """The format instruction, plus the Hades writing rules when they exist."""
+    rules = hades_cli.writing_rules(cli) if cli else ""
+    if not rules:
+        return SYSTEM_PROMPT
+    return (SYSTEM_PROMPT + "\n\nWrite the text inside <report> by these rules. They are "
+            "written for Portuguese; when the owner spoke another language, keep "
+            "their intent. They do not apply to <speech>.\n\n" + rules)
+
+
+def annotate_findings(report: str, findings: str) -> str:
+    """The report with the check's findings listed at its end."""
+    return (report.rstrip() + "\n\n---\n\nThe writing check (hades write-check) still "
+            "found these after one correction pass:\n\n" + findings.strip() + "\n")
 
 
 def _tag(text: str, name: str) -> str:
@@ -223,6 +261,42 @@ def _client():
     return registry.build(CLAUDE_PROVIDER_ID, get_provider_config(CLAUDE_PROVIDER_ID))
 
 
+def _vet_report(report: str, wcli: Optional[list], session_id: str, sysprompt: str,
+                cancel: threading.Event, progress, player) -> str:
+    """Run the Hades writing check; one correction pass by Claude on a finding.
+
+    Returns the text to save. Every way this can fail ends in the report as it
+    is: a check that cannot run, a correction that errors or comes back empty.
+    If the corrected text still has findings it is saved with them noted at
+    the end."""
+    if not wcli:
+        return report
+    clean, findings = hades_cli.write_check(wcli, report)
+    if clean is None:
+        _write_log(player, "writing check could not run; report saved as written")
+        return report
+    if clean:
+        return report
+    _write_log(player, "writing check found issues; asking Claude to fix them once")
+    from providers.llm_claude import ClaudeError
+    fixed = ""
+    try:
+        res = _client().run(
+            "The report you wrote fails the owner's writing check. Findings:\n\n"
+            f"{findings}\n\nRewrite the whole report so each finding is gone. Do not "
+            "change any fact, number, name or path. Reply with the <report> tag only.",
+            system=sysprompt, resume=session_id, cancel=cancel, on_event=progress)
+        fixed = parse_answer(res.text)["report"]
+    except (ClaudeError, RuntimeError, LookupError) as e:
+        _write_log(player, f"correction pass failed: {e}")
+    if not fixed or cancel.is_set():
+        return annotate_findings(report, findings)
+    clean2, findings2 = hades_cli.write_check(wcli, fixed)
+    if clean2 is not False:     # clean, or the second check could not run
+        return fixed
+    return annotate_findings(fixed, findings2)
+
+
 def _work(prompt: str, heard: str, resume: str, cancel: threading.Event,
           player, speak) -> None:
     """The slow part, on its own thread."""
@@ -240,7 +314,9 @@ def _work(prompt: str, heard: str, resume: str, cancel: threading.Event,
                     _write_log(player, f"Claude: {b.get('name', 'tool')}")
 
         try:
-            res = _client().run(prompt, system=SYSTEM_PROMPT, resume=resume,
+            wcli = _writing_cli()
+            sysprompt = system_prompt(wcli)
+            res = _client().run(prompt, system=sysprompt, resume=resume,
                                 cancel=cancel, on_event=progress)
         except (ClaudeError, RuntimeError, LookupError) as e:
             # RuntimeError/LookupError: the registry refusing to build the
@@ -277,13 +353,15 @@ def _work(prompt: str, heard: str, resume: str, cancel: threading.Event,
             _pending.clear()
         where = ""
         if ans["report"]:
-            path = write_report(heard, ans["report"])
+            report = _vet_report(ans["report"], wcli, res.session_id, sysprompt,
+                                 cancel, progress, player)
+            path = write_report(heard, report)
             where = path.name
             if player:
                 try:
                     player.show_content(
                         "CLAUDE — " + (heard or "report")[:30],
-                        f"Saved: {path}\n\n{ans['report']}")
+                        f"Saved: {path}\n\n{report}")
                 except Exception:
                     pass
         say = ans["speech"] or "Done."
