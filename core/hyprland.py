@@ -489,6 +489,7 @@ class Window:
     title: str
     pid: int
     workspace: int = 0
+    initial_cls: str = ""
 
     def label(self) -> str:
         return self.cls or self.title or self.address
@@ -502,11 +503,12 @@ def _parse_window(raw: dict) -> Window:
         title=str(raw.get("title") or ""),
         pid=int(raw.get("pid") or 0),
         workspace=int(ws.get("id", 0)) if isinstance(ws, dict) else 0,
+        initial_cls=str(raw.get("initialClass") or ""),
     )
 
 
-def list_windows() -> list[Window]:
-    proc = _call(["hyprctl", "clients", "-j"])
+def list_windows(timeout: float = 8.0) -> list[Window]:
+    proc = _call(["hyprctl", "clients", "-j"], timeout)
     try:
         raw = json.loads(proc.stdout or "[]")
     except json.JSONDecodeError:
@@ -576,7 +578,23 @@ def focus_window(query: str) -> Window:
     if not matches:
         raise HyprlandError(f"no open window matches '{query}'",
                             "check the name, or open the application first")
-    target = matches[0]
+    return _focus(matches[0])
+
+
+def focus_pid(pid: int) -> Window:
+    """Bring a window of process `pid` to the front and confirm it got there.
+
+    The window is looked up in `hyprctl clients` first and focused by address,
+    so "this process has no window" is an error here instead of an `ok` from a
+    dispatcher that had nothing to act on.
+    """
+    mine = [w for w in list_windows() if w.pid == pid]
+    if not mine:
+        raise HyprlandError(f"process {pid} has no window on screen")
+    return _focus(mine[0])
+
+
+def _focus(target: Window) -> Window:
     _dispatch("focuswindow", address=target.address)
     for _ in range(5):
         now = active_window()
