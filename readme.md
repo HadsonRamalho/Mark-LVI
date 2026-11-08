@@ -340,6 +340,8 @@ T=$(python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.confi
 curl -s -H "Authorization: Bearer $T" http://127.0.0.1:8000/api/state
 ```
 
+**Voice.** `/ws/voice` turns a local panel into the assistant's microphone and speaker, with the audio going straight to the Live model (nothing is transcribed, and **nothing is recorded or logged**). It takes the same loopback token as `/ws` (header or `?bridge=`) and, like everything on the bridge, only from `127.0.0.1` / `::1`; a paired phone session cannot open it. **One voice client at a time**: a second one gets `{"type": "busy"}` and is closed. Binary frames up are PCM16 little-endian, 16 kHz, mono, 20-40 ms (anything over 100 ms or 100 frames/s is refused with an `error`); frames down are PCM16, 24 kHz, mono. Control is JSON: the client sends `hello` (`{"mode": "ptt"|"open"}`, always first), `ptt` (`{"down": true|false}`), `mode` and `bye`; the assistant answers `ready`, then `state` (the bridge's state event, now with `voice: {remote, mode}`), `interrupted` (drop the queued audio), `busy` and `error` (`{"code": "..."}`). In `ptt` mode nothing goes up outside the press and releasing sends `audio_stream_end` so the answer starts at once; in `open` mode the stream is continuous and the wake word and sleep timer apply as on the desktop. While a voice client is connected the desktop microphone and speakers rest; when it leaves (or drops without `bye`) they come back, with no restart of the Live session.
+
 Self-test, no window needed: `python -m dashboard._bridge_tests`.
 
 ### ⚡ Nothing heavy is loaded for a feature you did not use
