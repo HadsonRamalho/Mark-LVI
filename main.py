@@ -596,6 +596,7 @@ class JarvisLive:
         self._is_speaking         = False
         self._speaking_lock       = threading.Lock()
         self._phone_active        = False   # True while phone mic is streaming; pauses PC mic
+        self._voice_hub           = None    # dashboard.voice.VoiceHub once the dashboard is up
         self._pending_vision       = None    # (img_bytes, mime_type, question, angle) to inject after tool response
         self._vision_cam_active    = False   # True if camera was opened for vision → auto-close after response
         self._vision_close_pending = False   # True after vision injected; next turn_complete closes camera
@@ -1102,6 +1103,70 @@ class JarvisLive:
         except Exception:
             pass
 
+    def _desktop_mic_paused(self) -> bool:
+        hub = self._voice_hub
+        return hub is not None and hub.remote
+
+    def _tell_remote_interrupted(self) -> None:
+        """Tell the remote voice client to drop the audio it has queued. May
+        be called from the Qt thread, so the hub is only touched on the loop."""
+        hub = self._voice_hub
+        if hub is None or not hub.remote:
+            return
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(hub.send_interrupted)
+        else:
+            hub.send_interrupted()
+
+    def _remote_interrupted(self) -> None:
+        """The Live server says the user talked over the answer."""
+        hub = self._voice_hub
+        if hub is None or not hub.remote:
+            return
+        q = self.audio_in_queue
+        while q is not None:
+            try:
+                q.get_nowait()
+            except Exception:
+                break
+        hub.send_interrupted()
+
+    def _remote_gate(self, pcm: bytes, mode: str) -> bool:
+        """May this remote frame reach the model? The same conditions the
+        desktop microphone obeys, minus the echo handling: the client's own
+        echo cancellation covers its speaker."""
+        if self.ui.muted:
+            return False
+        if mode == "ptt":
+            return True     # a deliberate press; talking over an answer is allowed
+        if self._wake_enabled and not self._awake:
+            det = self._wake_detector
+            if det is not None:
+                det.feed(np.frombuffer(pcm, dtype=np.int16).reshape(-1, 1))
+            return False
+        with self._speaking_lock:
+            if self._is_speaking:
+                return False
+        return True
+
+    def _remote_put_audio(self, pcm: bytes) -> None:
+        if self.out_queue is not None:
+            try:
+                self.out_queue.put_nowait({"data": pcm, "mime_type": "audio/pcm"})
+            except asyncio.QueueFull:
+                pass
+
+    def _remote_end_stream(self) -> None:
+        if self.out_queue is not None:
+            try:
+                self.out_queue.put_nowait({"audio_stream_end": True})
+            except asyncio.QueueFull:
+                pass
+
+    def _remote_wake(self) -> None:
+        if self._wake_enabled and not self._awake:
+            self.wake(reason="remote push-to-talk")
+
     def interrupt(self) -> None:
         """Stop JARVIS mid-speech: drain queued audio and open mic immediately."""
         self._interrupted = True
@@ -1117,6 +1182,7 @@ class JarvisLive:
             if drained:
                 print(f"[JARVIS] ✋ Interrupted — {drained} audio chunks discarded")
         self.set_speaking(False)
+        self._tell_remote_interrupted()
         # The words we were about to mouth are never going to be spoken now.
         self._visemes.reset()
         self._play_cursor = 0.0     # next batch starts a fresh timeline
@@ -1557,6 +1623,11 @@ class JarvisLive:
     async def _send_realtime(self):
         while True:
             msg = await self.out_queue.get()
+            if msg.get("audio_stream_end"):
+                # Queued behind the audio it closes, so the model gets the whole
+                # turn first (remote push-to-talk release).
+                await self.session.send_realtime_input(audio_stream_end=True)
+                continue
             # Gemini 3.x Live rejects the old realtime_input.media_chunks field
             # (what `media=...` maps to) and closes the socket with a 1007. Send
             # mic / phone PCM through the new `audio` field instead. Queue items
@@ -1574,6 +1645,11 @@ class JarvisLive:
         loop = asyncio.get_event_loop()
 
         def callback(indata, frames, time_info, status):
+            # A remote voice client (the bridge's /ws/voice) is the microphone
+            # now: nothing from this device goes to the model or the wake-word
+            # detector until it leaves.
+            if self._desktop_mic_paused():
+                return
             # ── Wake-word gate ───────────────────────────────────────────────
             # While asleep, the mic audio NEVER goes to Gemini (nothing is
             # streamed, so JARVIS can't respond to speech not addressed to it and
@@ -1773,6 +1849,9 @@ class JarvisLive:
 
                     if response.server_content:
                         sc = response.server_content
+
+                        if getattr(sc, "interrupted", False):
+                            self._remote_interrupted()
 
                         if sc.output_transcription and sc.output_transcription.text:
                             txt = _clean_transcript(sc.output_transcription.text)
@@ -1991,7 +2070,12 @@ class JarvisLive:
                     pass
 
                 try:
-                    await asyncio.to_thread(stream.write, bytes(batch))
+                    hub = self._voice_hub
+                    if hub is not None and hub.remote:
+                        # The client plays it; the desktop stays silent.
+                        await hub.send_audio(bytes(batch))
+                    else:
+                        await asyncio.to_thread(stream.write, bytes(batch))
                 except (RuntimeError, asyncio.CancelledError):
                     break   # executor shutting down — exit cleanly
         except Exception as e:
@@ -2473,6 +2557,12 @@ class JarvisLive:
             self._dashboard = DashboardServer()
             self._dashboard.set_connect_callback(self._on_phone_connected)
             self._dashboard.set_state_provider(self._bridge_state)
+            self._voice_hub = self._dashboard.voice
+            self._voice_hub.bind(
+                put_audio=self._remote_put_audio,
+                end_stream=self._remote_end_stream,
+                wake=self._remote_wake,
+                gate=self._remote_gate)
             self.ui.set_change_listener(self._dashboard.state_changed)
             from actions import claude_task as _ct
             _ct.set_report_listener(self._dashboard.state_changed)

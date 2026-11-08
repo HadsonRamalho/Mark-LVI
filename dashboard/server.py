@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 
 from dashboard import bridge as _bridge
+from dashboard.voice import VoiceClose, VoiceHub
 
 _DEPS_OK = False
 try:
@@ -735,6 +736,9 @@ class DashboardServer:
         # was not written for.
         self._bridge_token                = _bridge.new_token()
         self._bridge_clients: set[WebSocket] = set()
+        # The one remote voice client of /ws/voice (see dashboard/voice.py).
+        self.voice = VoiceHub(state_body=lambda: self.state_body(),
+                              on_change=lambda: self.state_changed())
         self._state_provider              = None
         self._last_state_body: dict | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -862,13 +866,15 @@ class DashboardServer:
                     "permission_mode", "default"),
             },
             "last_report": body.get("last_report"),
+            "voice": self.voice.snapshot(),
         }
 
     def state_changed(self) -> None:
         """Tell loopback panels the state may have changed. Safe from any
         thread; does nothing before the server is serving."""
         loop = self._loop
-        if loop is None or loop.is_closed() or not self._bridge_clients:
+        if (loop is None or loop.is_closed()
+                or not (self._bridge_clients or self.voice.remote)):
             return
         try:
             asyncio.run_coroutine_threadsafe(self._push_state(), loop)
@@ -881,6 +887,7 @@ class DashboardServer:
             return
         self._last_state_body = body
         await self._send_state(self._bridge_clients, body)
+        self.voice.push_state(body)
 
     async def _send_state(self, targets, body: dict) -> None:
         dead = set()
@@ -1286,7 +1293,80 @@ class DashboardServer:
                 self._clients.discard(websocket)
                 self._bridge_clients.discard(websocket)
 
+        @app.websocket("/ws/voice")
+        async def voice_ws(websocket: WebSocket, bridge: str = ""):
+            # Loopback token only. A paired phone session (`?token=`) is not a
+            # way in: audio to the model is for the local panel that relays it.
+            presented = (websocket.headers.get("authorization", "")
+                         .removeprefix("Bearer ").strip() or bridge)
+            if not _bridge.accepts(
+                    self._bridge_token, getattr(websocket.client, "host", None),
+                    presented):
+                await websocket.close(code=4001)
+                return
+            await websocket.accept()
+            await self._serve_voice(websocket)
+
         return app
+
+    async def _serve_voice(self, websocket: WebSocket) -> None:
+        hub = self.voice
+        session = hub.new_session()
+        if not hub.try_attach(session):
+            await websocket.send_json({"type": "busy"})
+            await websocket.close()
+            return
+        writer = asyncio.create_task(self._voice_writer(websocket, session))
+        try:
+            while True:
+                wait = hub.time_left(session)
+                try:
+                    msg = await asyncio.wait_for(websocket.receive(), wait)
+                except asyncio.TimeoutError:
+                    raise VoiceClose("idle_timeout")
+                if msg["type"] == "websocket.disconnect":
+                    break
+                if msg.get("bytes") is not None:
+                    hub.handle_audio(session, msg["bytes"])
+                elif msg.get("text") is not None:
+                    try:
+                        body = json.loads(msg["text"])
+                    except ValueError:
+                        raise VoiceClose("bad_message")
+                    hub.handle_text(session, body)
+        except VoiceClose as end:
+            if end.code:
+                session.send_json({"type": "error", "code": end.code})
+        except WebSocketDisconnect:
+            pass
+        except RuntimeError:
+            pass            # receive() after the socket closed
+        finally:
+            hub.detach(session)
+            session.finish()
+            try:
+                await asyncio.wait_for(writer, 2.0)
+            except Exception:
+                writer.cancel()
+
+    async def _voice_writer(self, websocket: WebSocket, session) -> None:
+        """The only task that sends on a voice socket, so audio, state and
+        control never interleave inside one message."""
+        try:
+            while True:
+                kind, payload = await session.out.get()
+                if kind == "close":
+                    break
+                if kind == "bytes":
+                    await websocket.send_bytes(payload)
+                else:
+                    await websocket.send_json(payload)
+        except Exception:
+            pass
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
     # ── serve ─────────────────────────────────────────────────────────────
 
