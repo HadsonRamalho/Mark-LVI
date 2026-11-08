@@ -253,6 +253,18 @@ For anything that is not trivial — a multi-step action, a plan, a written repo
 
 **To test by voice:** turn it on, then say something like "write me a report of the open pull requests in this repository". Expect one short spoken acknowledgement, activity-log lines while it works, then a sentence and the report on screen. `python -m providers._tests` covers all of this with a fake `claude`, so it spends nothing.
 
+### 📖 "Read me the report"
+
+Claude's reports are never read unprompted: you hear one sentence and where the report is. Ask for it and the new `read_report` tool reads it, a block at a time. It is always offered, whether or not Claude is switched on, and it works on whatever is already in `memory/claude/reports/`.
+
+**Which report:** the latest unless you say otherwise. Name it ("the one about pull requests" — part of the title or file name, accents and case ignored), give a day ("today", "yesterday", `2026-11-05`), or ask for the one before ("the one before", "the second to last").
+
+**How it reads:** the Markdown becomes text that sounds right. Headings are said before their section. A table is read a row at a time ("Service: api; State: active.") and its header row is not read alone. Code blocks are read whole. Inline code that is a file path, a URL or a command is left out, and the sentence around it still makes sense. A link is read as its text; bold, italics, bullets, numbering and emoji are dropped. The text is cut into blocks of about 900 characters, by section and then by paragraph.
+
+**What you say:** "next", "go back", "again", "skip to the conclusion" (or "section 3"), "what sections are there", "stop". After each block the assistant asks whether to go on, and says so when the report is over. The assistant reads the block exactly as it comes: the prompt forbids summarising it. The voice is the same Gemini Live voice as always; there is no second text-to-speech. Where the reading is (report, block, total) is kept in memory for the running process, so it is gone after a restart.
+
+**To test:** `python -m actions._read_report_tests`. It writes its reports into a temporary folder and never touches `memory/`. By voice, after Claude has written a report: "read me the report".
+
 ### 🔱 Ask the Hades, and have it write like the Hades
 
 The `hades` plugin is a voice front for the Hades command line. Nothing to switch on: the file exists, so it is on.
@@ -696,6 +708,7 @@ Mark LVI/
 ├── actions/                  # Bundled skills — each self-describes via a TOOL dict + handler
 │                             #   Everything here drives the COMPUTER, which is what decides
 │                             #   whether a new skill belongs in this folder at all.
+│   ├── read_report.py        # Reads a saved Claude report aloud, block by block
 │   ├── web_search.py         # Gemini + DDG parallel search (news, research, price, compare)
 │   ├── screen_processor.py   # Screen & webcam capture for vision
 │   ├── background_monitor.py # User-configured topic watching — daily DDG check
