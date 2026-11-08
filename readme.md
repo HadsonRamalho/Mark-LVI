@@ -253,6 +253,20 @@ For anything that is not trivial — a multi-step action, a plan, a written repo
 
 **To test by voice:** turn it on, then say something like "write me a report of the open pull requests in this repository". Expect one short spoken acknowledgement, activity-log lines while it works, then a sentence and the report on screen. `python -m providers._tests` covers all of this with a fake `claude`, so it spends nothing.
 
+### 🔱 Ask the Hades, and have it write like the Hades
+
+The `hades` plugin is a voice front for the Hades command line. Nothing to switch on: the file exists, so it is on.
+
+**You can ask** (read-only, answered at once): which agents are active, parked or done; the loop status; token usage with the 5-hour and weekly window; whether the environment is healthy (the doctor's counts and the first error with its fix). Long answers go to the panel, the voice says one or two sentences.
+
+**You can ask it to act:** resume or park an agent, update, pause or resume the local environment, open the panel (`http://127.0.0.1:21220`). **Every action asks first.** The first call only returns the question; the action runs only on a second call that confirms that same action and agent within two minutes. The answer is what the command printed and its exit code. An agent name is matched to the real list ("a balão" finds `a-balao`) and confirmed by its real name; two look-alikes are asked about, not guessed. The environment actions run the scripts in the Hades instance folder (`hades instance`); a machine without them is told so.
+
+**Where the CLI is:** found by itself (`hades` on the `PATH`, then `~/.claude/skills/hades/loop/bin/hades`, then `bun ~/.claude/skills/hades/src/cli.ts`). Set another path under ⚙ → Hades. Agents are listed per project: set *Project folder for agents* to list another project's.
+
+**Claude's reports follow the Hades writing guide.** With the Hades installed, `claude_task` adds the rules of `reference/escrita.md` to Claude's prompt and runs `hades write-check` on the report before saving it. A finding gets one correction pass by Claude; if the check still finds something, the report is saved with the findings listed at its end. Without the guide or the CLI nothing changes. The toggle is ⚙ → Hades → *Check Claude reports*.
+
+**To test by voice:** "how is the Hades?", "which agents are running?", "how much of my 5-hour limit is used?", then "pause the Hades environment" and answer yes when it asks. `python -m plugins._hades_tests` covers it with a fake CLI: no real agent or environment is touched.
+
 ### 🎧 The audio panel can prove it hears you
 
 Every automated probe in `core/audio_devices.py` runs on silence, which is what lets it run at startup without anyone noticing. It also means a muted microphone, a level slider at zero and a privacy shutter all pass every test and deliver a flat line. Only a person speaking can settle that.
