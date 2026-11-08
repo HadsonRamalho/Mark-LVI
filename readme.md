@@ -329,6 +329,19 @@ afterwards** rather than assumed. When the prompt is declined, the QR panel says
 so on screen — the person scanning the code is looking at the HUD, not at a
 terminal.
 
+### 🔌 The bridge for local panels
+
+The dashboard also has a second way in, for programs on **this machine** (the Hades panel shows the assistant on its canvas through it). On start the dashboard writes `~/.config/mark-lvi/bridge.json` (mode 600) with `{"port", "token", "scheme", "pid"}`; the token is new on every run and the file is deleted on exit. Set `MARK_BRIDGE_FILE` to put it elsewhere.
+
+The token works **only from `127.0.0.1` / `::1`**. From any other address it is refused like a wrong one, and the phone flow (pairing key, AES) is unchanged. With it, send `Authorization: Bearer <token>` to `GET /api/state`, `POST /api/command` (`{"text": "..."}` or the raw text) and `POST /api/wake`, or open `/ws` with the same header or `?bridge=<token>` to get the activity log plus a `{"type": "state", ...}` event on every state, speech or mute change.
+
+```bash
+T=$(python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.config/mark-lvi/bridge.json')))['token'])")
+curl -s -H "Authorization: Bearer $T" http://127.0.0.1:8000/api/state
+```
+
+Self-test, no window needed: `python -m dashboard._bridge_tests`.
+
 ### ⚡ Nothing heavy is loaded for a feature you did not use
 
 `pyautogui` is 394 ms and OpenCV is 224 ms, and both were paid at **every** launch by the folder scan that discovers actions and plugins — whether or not anyone asked for a keystroke or pointed a webcam at anything.
