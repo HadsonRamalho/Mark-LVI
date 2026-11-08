@@ -1021,6 +1021,21 @@ class JarvisLive:
         elif not self.ui.muted:
             self.ui.set_state("LISTENING")
 
+    def _bridge_state(self) -> dict:
+        """Body of the dashboard's /api/state. Reads the UI's plain mirror and
+        the saved settings; never a widget, so any thread may call it."""
+        from actions import claude_task
+        from memory.config_manager import get_assistant_name, get_claude_settings
+        snap = self.ui.snapshot()
+        cfg = get_claude_settings()
+        return {
+            "name": get_assistant_name(),
+            **snap,
+            "claude": {"enabled": cfg["enabled"],
+                       "permission_mode": cfg["permission_mode"]},
+            "last_report": claude_task.last_report(),
+        }
+
     def set_push_to_talk(self, enabled: bool) -> str:
         """Turn hold-to-talk on or off. Returns the scope actually achieved."""
         from core.hotkey import PushToTalk
@@ -2457,6 +2472,10 @@ class JarvisLive:
             from dashboard.server import DashboardServer
             self._dashboard = DashboardServer()
             self._dashboard.set_connect_callback(self._on_phone_connected)
+            self._dashboard.set_state_provider(self._bridge_state)
+            self.ui.set_change_listener(self._dashboard.state_changed)
+            from actions import claude_task as _ct
+            _ct.set_report_listener(self._dashboard.state_changed)
             asyncio.create_task(self._dashboard.serve())
             # Runs for the whole lifetime, not just inside an active session
             asyncio.create_task(self._process_dashboard_commands())
@@ -2725,6 +2744,9 @@ class JarvisLive:
 
 def main():
     ui = JarvisUI("face.png")
+    # Main thread: the only one where signal handlers can be installed.
+    from dashboard import bridge
+    bridge.install_cleanup()
 
     def runner():
         ui.wait_for_api_key()

@@ -7210,6 +7210,9 @@ class MainWindow(QMainWindow):
             return
         self._muted = muted
         self.hud.muted = muted
+        cb = getattr(self, "on_muted_changed", None)
+        if cb:
+            cb(muted)
         self._style_mute_btn()
         if muted:
             self._apply_state("MUTED")
@@ -7345,6 +7348,12 @@ class JarvisUI:
         self._app.setStyle("Fusion")
         self._win = MainWindow(face_path)
         self.root = _RootShim(self._app)
+        # Plain-Python mirror of what the window shows, for readers on other
+        # threads (the loopback bridge): reading the widgets themselves from a
+        # worker thread is not allowed, a str and a bool are.
+        self._mirror = {"state": "INITIALISING", "muted": False}
+        self._on_change = None
+        self._win.on_muted_changed = self._mute_changed
         self._win.show()
 
     @property
@@ -7495,7 +7504,35 @@ class JarvisUI:
         self._win.notify_phone_connected()
 
     def set_state(self, state: str):
+        self._mirror["state"] = state
         self._win._state_sig.emit(state)
+        self._notify_change()
+
+    def snapshot(self) -> dict:
+        """Thread-safe: {"state", "speaking", "muted"} as the HUD shows them.
+        Muted reads as state "MUTED", like the HUD."""
+        muted = bool(self._mirror["muted"])
+        state = "MUTED" if muted else self._mirror["state"]
+        return {"state": state, "speaking": state == "SPEAKING", "muted": muted}
+
+    def set_change_listener(self, fn) -> None:
+        """`fn()` is called after a state or mute change, on whichever thread
+        changed it. It must be quick and must not touch widgets."""
+        self._on_change = fn
+
+    def _mute_changed(self, muted: bool) -> None:
+        self._mirror["muted"] = bool(muted)
+        if not muted:
+            self._mirror["state"] = "LISTENING"     # what the window sets on unmute
+        self._notify_change()
+
+    def _notify_change(self) -> None:
+        fn = self._on_change
+        if fn:
+            try:
+                fn()
+            except Exception:
+                pass
 
     def write_log(self, text: str):
         self._win._log_sig.emit(text)

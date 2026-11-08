@@ -12,6 +12,7 @@ Install deps:  pip install fastapi "uvicorn[standard]" cryptography
 import asyncio
 import base64
 import hashlib
+import json
 import re
 import secrets
 import socket
@@ -19,6 +20,8 @@ import string
 import threading
 import time
 from pathlib import Path
+
+from dashboard import bridge as _bridge
 
 _DEPS_OK = False
 try:
@@ -726,6 +729,15 @@ class DashboardServer:
         self._token_keys: dict[str, str]  = {}   # auth_token → session_key
         self._aes_cache:  dict[str, bytes]= {}   # session_key → AES bytes
         self._clients: set[WebSocket]     = set()
+        # Loopback panels (see dashboard/bridge.py). The token is new on every
+        # run; `_bridge_clients` is the subset of `_clients` that also gets
+        # `state` events, so the phone page never sees a message type it
+        # was not written for.
+        self._bridge_token                = _bridge.new_token()
+        self._bridge_clients: set[WebSocket] = set()
+        self._state_provider              = None
+        self._last_state_body: dict | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._history: list[dict]         = []
         self._command_queue               = asyncio.Queue()
         self._wake_callback               = None
@@ -828,6 +840,58 @@ class DashboardServer:
     def set_connect_callback(self, fn) -> None:
         self._connect_callback = fn
 
+    def set_state_provider(self, fn) -> None:
+        """`fn() -> dict` returns the body of /api/state. It must only read
+        plain fields, never a Qt widget: it is called on the server's loop."""
+        self._state_provider = fn
+
+    def state_body(self) -> dict:
+        try:
+            body = self._state_provider() if self._state_provider else {}
+        except Exception as exc:
+            print(f"[Dashboard] state provider failed: {exc}")
+            body = {}
+        return {
+            "name": body.get("name", "JARVIS"),
+            "state": body.get("state", "INITIALISING"),
+            "speaking": bool(body.get("speaking", False)),
+            "muted": bool(body.get("muted", False)),
+            "claude": {
+                "enabled": bool((body.get("claude") or {}).get("enabled", False)),
+                "permission_mode": (body.get("claude") or {}).get(
+                    "permission_mode", "default"),
+            },
+            "last_report": body.get("last_report"),
+        }
+
+    def state_changed(self) -> None:
+        """Tell loopback panels the state may have changed. Safe from any
+        thread; does nothing before the server is serving."""
+        loop = self._loop
+        if loop is None or loop.is_closed() or not self._bridge_clients:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self._push_state(), loop)
+        except RuntimeError:
+            pass
+
+    async def _push_state(self) -> None:
+        body = self.state_body()
+        if body == self._last_state_body:
+            return
+        self._last_state_body = body
+        await self._send_state(self._bridge_clients, body)
+
+    async def _send_state(self, targets, body: dict) -> None:
+        dead = set()
+        for ws in list(targets):
+            try:
+                await ws.send_json({"type": "state", **body})
+            except Exception:
+                dead.add(ws)
+        self._clients -= dead
+        self._bridge_clients -= dead
+
     # ── broadcast ────────────────────────────────────────────────────────
 
     async def broadcast(self, msg: dict) -> None:
@@ -861,9 +925,17 @@ class DashboardServer:
                 return False
             return True
 
+        def _bridge_ok(req: Request) -> bool:
+            """The loopback token, from a loopback peer only. The peer is the
+            socket's address, never a forwarded-for header."""
+            return _bridge.accepts(
+                self._bridge_token, getattr(req.client, "host", None),
+                req.headers.get("authorization", "").removeprefix("Bearer "))
+
         def _auth(req: Request) -> bool:
-            return _valid(req.headers.get("authorization", "")
-                          .removeprefix("Bearer ").strip())
+            return _bridge_ok(req) or _valid(
+                req.headers.get("authorization", "")
+                .removeprefix("Bearer ").strip())
 
         def _who(req: Request) -> str:
             """The client address a throttle counts against."""
@@ -1016,6 +1088,22 @@ class DashboardServer:
         async def command(req: Request):
             if not _auth(req):
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            if _bridge_ok(req):
+                # Plain text: a JSON {"text": ...} like the phone page sends
+                # without AES, or the raw body when it is not JSON.
+                raw = (await req.body()).decode("utf-8", "replace")
+                try:
+                    parsed = json.loads(raw)
+                    text = (parsed.get("text") or "") if isinstance(parsed, dict) \
+                        else str(parsed)
+                except ValueError:
+                    text = raw
+                text = text.strip()
+                if text:
+                    await self._command_queue.put(text)
+                    if self._wake_callback:
+                        self._wake_callback()
+                return JSONResponse({"ok": True})
             body  = await req.json()
             token = req.headers.get("authorization", "").removeprefix("Bearer ").strip()
             enc   = body.get("enc", "")
@@ -1030,6 +1118,12 @@ class DashboardServer:
                 if self._wake_callback:
                     self._wake_callback()
             return JSONResponse({"ok": True})
+
+        @app.get("/api/state")
+        async def state_ep(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            return JSONResponse(self.state_body())
 
         @app.post("/api/wake")
         async def wake_ep(req: Request):
@@ -1156,9 +1250,14 @@ class DashboardServer:
             return FileResponse(str(path), filename=safe)
 
         @app.websocket("/ws")
-        async def ws_ep(websocket: WebSocket, token: str = ""):
+        async def ws_ep(websocket: WebSocket, token: str = "", bridge: str = ""):
             tok = token.strip()
-            if not _valid(tok):
+            presented = (websocket.headers.get("authorization", "")
+                         .removeprefix("Bearer ").strip() or bridge)
+            is_bridge = _bridge.accepts(
+                self._bridge_token, getattr(websocket.client, "host", None),
+                presented)
+            if not is_bridge and not _valid(tok):
                 await websocket.close(code=4001)
                 return
             await websocket.accept()
@@ -1168,6 +1267,9 @@ class DashboardServer:
                     await websocket.send_json(entry)
                 except Exception:
                     break
+            if is_bridge:
+                self._bridge_clients.add(websocket)
+                await self._send_state([websocket], self.state_body())
             try:
                 while True:
                     data = await websocket.receive_json()
@@ -1182,6 +1284,7 @@ class DashboardServer:
                 pass
             finally:
                 self._clients.discard(websocket)
+                self._bridge_clients.discard(websocket)
 
         return app
 
@@ -1309,4 +1412,15 @@ class DashboardServer:
 
         print(f"[Dashboard] {self.get_url()}")
         print("[Dashboard] Press 'Remote Control' in JARVIS UI to get the QR code.")
-        await uvicorn.Server(cfg).serve()
+        self._loop = asyncio.get_running_loop()
+        # Written only now that the port is ours, so a second copy that failed
+        # to bind never overwrites the first copy's file.
+        try:
+            _bridge.write(SECURE_PORT if use_ssl else PORT,
+                          self._bridge_token, "https" if use_ssl else "http")
+        except OSError as exc:
+            print(f"[Dashboard] bridge file not written: {exc}")
+        try:
+            await uvicorn.Server(cfg).serve()
+        finally:
+            _bridge.remove()

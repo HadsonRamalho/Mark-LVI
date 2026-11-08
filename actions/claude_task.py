@@ -206,6 +206,55 @@ def write_report(heard: str, report: str, when: Optional[datetime] = None) -> Pa
     return path
 
 
+_last_report: dict | None = None
+_report_listener: Optional[Callable] = None
+
+
+def set_report_listener(fn: Optional[Callable]) -> None:
+    """`fn()` is called (on the worker thread) each time a report is saved."""
+    global _report_listener
+    _report_listener = fn
+
+
+def _title_of(path: Path, fallback: str = "") -> str:
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines()[:30]:
+            if line.startswith("#"):
+                return line.lstrip("#").strip()[:120]
+    except OSError:
+        pass
+    return (fallback or path.stem)[:120]
+
+
+def last_report() -> Optional[dict]:
+    """{"path", "title", "ts"} of the newest report, or None. `ts` is Unix
+    seconds. Remembered in memory; after a restart it is read back from the
+    reports folder, so the answer survives a restart."""
+    global _last_report
+    if _last_report is None:
+        try:
+            files = sorted((_data_dir() / "reports").glob("*.md"),
+                           key=lambda p: p.stat().st_mtime)
+            if files:
+                p = files[-1]
+                _last_report = {"path": str(p), "title": _title_of(p),
+                                "ts": int(p.stat().st_mtime)}
+        except OSError:
+            return None
+    return dict(_last_report) if _last_report else None
+
+
+def _remember_report(path: Path, heard: str) -> None:
+    global _last_report
+    _last_report = {"path": str(path), "title": _title_of(path, heard),
+                    "ts": int(time.time())}
+    if _report_listener:
+        try:
+            _report_listener()
+        except Exception:
+            pass
+
+
 def log_request(entry: dict) -> None:
     """Append one line to the measurement log. Never raises: a full disk must
     not turn a working request into a failed one."""
@@ -356,6 +405,7 @@ def _work(prompt: str, heard: str, resume: str, cancel: threading.Event,
             report = _vet_report(ans["report"], wcli, res.session_id, sysprompt,
                                  cancel, progress, player)
             path = write_report(heard, report)
+            _remember_report(path, heard)
             where = path.name
             if player:
                 try:
